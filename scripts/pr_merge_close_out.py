@@ -400,9 +400,8 @@ verdict so its condition reads UNSTATED; a row count that differs from the
 field's; and a row numbered differently from the condition it paired to, which
 still files, because the pairing decides and the number was only ever a label.
 
-**The required close-out shape is stated in CLAUDE.md**, in the
-``pt-delegation`` marked block, where a session reads it before writing its
-close-out. Widening the parser alone leaves the next shape to be found by a
+**The required close-out shape is stated in delegation.md**, which CLAUDE.md
+imports, so a session reads it before writing its close-out. Widening the parser alone leaves the next shape to be found by a
 failure instead of by a rule.
 
 A held ticket gets a second reader — PPA-1556
