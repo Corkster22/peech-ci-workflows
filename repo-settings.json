@@ -1,0 +1,63 @@
+{
+  "Corkster22/peech-pmo-automation": {
+    "branch": "main",
+    "protection": {
+      "pull_request_required": true,
+      "required_approving_review_count": 0,
+      "required_status_checks": ["test-gate", "ruff", "Read the diff against its ticket"],
+      "strict": false,
+      "enforce_admins": true
+    },
+    "merge": {
+      "allow_auto_merge": true,
+      "allow_squash_merge": true,
+      "delete_branch_on_merge": true
+    }
+  },
+  "Corkster22/peech-skills": {
+    "branch": "main",
+    "protection": {
+      "pull_request_required": true,
+      "required_approving_review_count": 0,
+      "required_status_checks": ["Validate skill files"],
+      "strict": false,
+      "enforce_admins": true
+    },
+    "merge": {
+      "allow_auto_merge": true,
+      "allow_squash_merge": true,
+      "delete_branch_on_merge": true
+    }
+  },
+  "Peech-LLC/peech-org-skills": {
+    "branch": "main",
+    "blocked_by": "PPA-1071",
+    "protection": {
+      "pull_request_required": true,
+      "required_approving_review_count": 0,
+      "required_status_checks": ["Validate org skill files", "Test plugin pt-automation-hooks"],
+      "strict": false,
+      "enforce_admins": true
+    },
+    "merge": {
+      "allow_auto_merge": true,
+      "allow_squash_merge": true,
+      "delete_branch_on_merge": true
+    }
+  },
+  "Corkster22/peech-ci-workflows": {
+    "branch": "main",
+    "protection": {
+      "pull_request_required": true,
+      "required_approving_review_count": 0,
+      "required_status_checks": ["pytest"],
+      "strict": false,
+      "enforce_admins": true
+    },
+    "merge": {
+      "allow_auto_merge": false,
+      "allow_squash_merge": true,
+      "delete_branch_on_merge": false
+    }
+  }
+}
