@@ -2883,7 +2883,8 @@ def test_the_workflow_passes_the_channel_input_and_the_token():
     assert call["inputs"]["slack_channel"]["required"] is False
     assert call["inputs"]["slack_channel"]["type"] == "string"
     assert call["secrets"]["SLACK_BOT_TOKEN"]["required"] is False
-    assert step["env"][closeout.CHANNEL_VAR] == "${{ inputs.slack_channel }}"
+    assert step["env"][closeout.CHANNEL_VAR] == (
+        "${{ inputs.slack_channel || secrets.SLACK_CHANNEL_DELIVERY_OPS }}")
     assert step["env"][closeout.TOKEN_VAR] == "${{ secrets.SLACK_BOT_TOKEN }}"
     assert not re.search(r"xox[abprs]-", text), "a Slack token is in the file"
     assert not re.search(r"\bC0[A-Z0-9]{6,}\b", text), "a channel id is in the file"
