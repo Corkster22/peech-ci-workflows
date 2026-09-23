@@ -122,7 +122,7 @@ jobs:
         # passed, so the channel is empty and the notice is a reported skip.
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL_DELIVERY_OPS: ${{ inputs.slack_channel }}
+          SLACK_CHANNEL_DELIVERY_OPS: ${{ inputs.slack_channel || secrets.SLACK_CHANNEL_DELIVERY_OPS }}
         run: python .peech-ci-workflows/scripts/pr_merge_close_out.py
 
   regrade-held:
