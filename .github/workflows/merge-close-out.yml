@@ -1,0 +1,99 @@
+name: Merge Close-Out — Record
+
+# PPA-1577. The merge close-out peech-pmo-automation runs on its own merges,
+# served as a callable workflow so a caller repository stops carrying copies of
+# scripts/pr_merge_close_out.py and scripts/pt_transition.py. The caller runs
+# this on push to main and passes its own Jira pair; no secret is stored here.
+#
+# Every rule this workflow applies lives in scripts/pr_merge_close_out.py, with
+# its own pytest coverage under scripts/tests/. Nothing is decided in YAML: a
+# rule expressed in a workflow step cannot be unit-tested.
+#
+# The caller's file must itself be .github/workflows/merge-close-out.yml, on
+# push to main. The github context of a called workflow is the caller's, and
+# pt_transition.merge_close_out_run() reads GITHUB_WORKFLOW_REF, GITHUB_EVENT_NAME
+# and GITHUB_REF to recognise a close-out run, so a caller under another name or
+# trigger is refused the In Progress to Done hop.
+#
+# No re-grade sweep here: peech-pmo-automation's hourly schedule stays there.
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    secrets:
+      JIRA_EMAIL:
+        required: true
+      JIRA_API_TOKEN:
+        required: true
+      # The held-at-In-Progress notice posts through peech_shared.slack, which
+      # this repository does not carry. Without it the notice degrades to a
+      # reported skip and the routing is unchanged, so the token is optional.
+      SLACK_BOT_TOKEN:
+        required: false
+
+jobs:
+  close-out:
+    name: Comment the hash and transition
+    runs-on: ubuntu-latest
+
+    steps:
+      # The caller repository at the merge commit, at the workspace root: the
+      # script reads the merge message and hash from git in its working
+      # directory.
+      - name: Checkout the caller repository
+        uses: actions/checkout@v6
+
+      - name: Checkout peech-ci-workflows
+        uses: actions/checkout@v6
+        with:
+          repository: Corkster22/peech-ci-workflows
+          ref: main
+          path: .peech-ci-workflows
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # pt_transition.py holds one absolute credential path by design
+      # (PPA-1126: one .env is one place to rotate a token), and this workflow
+      # calls that script rather than reimplementing it, so the path has to
+      # exist on the runner. This step copies the two secrets the caller passed
+      # into the file the script reads, and nothing else. GitHub masks a secret
+      # in the log on its own.
+      - name: Materialise the credential file pt_transition.py reads
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${JIRA_EMAIL}" ] || [ -z "${JIRA_API_TOKEN}" ]; then
+            echo "JIRA_EMAIL or JIRA_API_TOKEN was not passed by the caller"
+            exit 1
+          fi
+          target="${HOME}/Documents/Claude-Projects/peech-pmo-automation/secrets"
+          mkdir -p "${target}"
+          umask 077
+          {
+            printf 'JIRA_EMAIL=%s\n' "${JIRA_EMAIL}"
+            printf 'JIRA_API_TOKEN=%s\n' "${JIRA_API_TOKEN}"
+          } > "${target}/.env"
+          echo "wrote ${target}/.env"
+
+      # The commit message is read from git inside the script and never
+      # interpolated into this shell, so nothing a commit message contains can
+      # be expanded or executed here. Run from the caller's root, so git reads
+      # the caller's merge.
+      - name: Close out every PPA key the merge carried, and report any it does not
+        # Whether vars resolves to the caller's variables or this repository's
+        # was not confirmed against GitHub's documentation. Nothing breaks
+        # either way: notify_held() skips an unset channel, and a set one
+        # reaches post_notice(), whose import of peech_shared.slack fails on
+        # this runner and is reported as "notice not sent". The routing is
+        # unchanged whatever the channel holds.
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_DELIVERY_OPS: ${{ vars.SLACK_CHANNEL_DELIVERY_OPS }}
+        run: python .peech-ci-workflows/scripts/pr_merge_close_out.py
