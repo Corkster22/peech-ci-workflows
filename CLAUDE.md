@@ -59,8 +59,8 @@ This repository calls none of its own workflows, so no workflow opens, arms or
 closes out a pull request here. That replaces the Delegation block's close-out
 bullet for this repository only:
 
-- The session commits to `ppa-<key>` and pushes, then posts its close-out
-  checklist on each ticket before it stops.
+- The session commits to `ppa-<key>`, posts its close-out checklist on each
+  ticket, then pushes and stops.
 - The conductor opens the pull request and merges it once `pytest` passes.
 - No merge here records a hash or applies a transition. The conductor does
   both by hand.
