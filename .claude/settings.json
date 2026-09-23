@@ -5,5 +5,19 @@
       "Bash(git commit:*)",
       "Bash(git push:*)"
     ]
+  },
+  "env": {
+    "ENABLE_CLAUDEAI_MCP_SERVERS": "false"
+  },
+  "enabledPlugins": {
+    "pt-automation-hooks@peech-org": true
+  },
+  "extraKnownMarketplaces": {
+    "peech-org": {
+      "source": {
+        "source": "github",
+        "repo": "Peech-LLC/peech-org-skills"
+      }
+    }
   }
 }
