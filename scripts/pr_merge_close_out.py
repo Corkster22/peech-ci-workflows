@@ -17,10 +17,12 @@ Amended 16-SEP-2026 under PPA-1459, which replaces PPA-1382's rule that Done
 was not a value this script could produce, and again 17-SEP-2026 under
 PPA-1518, which gives a failed grade an outcome of its own.
 
-* **Any status but In Progress** -> comment, no transition, and report the skip
-  naming the status found. A key still at To Do is the signal that the
-  UserPromptSubmit hook did not fire, and it has to stay visible rather than be
-  quietly fixed.
+* **To Do** -> **In Progress** first, then on exactly as a key found at In
+  Progress: Done, Client Validation or held. PPA-1601. The outcome line says
+  the key started at To Do, so the missed hop stays visible.
+* **Any other status but In Progress** -> comment, no transition, and report
+  the skip naming the status found. Client Validation, Reopened and Done are
+  left as they are.
 * **In Progress** -> **Done**, but only when all three hold together: the
   Definition of Done carries at least one condition, every condition opens with
   the class token ``[machine]``, and the verdict table reports every one MET.
@@ -50,6 +52,22 @@ that will not build - warns and routes to Client Validation. No failure path
 may produce Done. Holding a finished ticket costs a conductor hop; closing an
 unfinished one costs a false record, which is the failure the next section was
 written from.
+
+A merged key at To Do is walked forward
+---------------------------------------
+PPA-1601. This file used to skip a key at To Do, on the ground that it was the
+signal the UserPromptSubmit hook had not fired and had to stay visible. As a
+called workflow it serves repositories where no such hook runs, so the skip
+fired on ordinary merges and a conductor moved the ticket by hand every time.
+Two dated incidents: peech-pmo-automation run 35804893081 (PR #104,
+22-SEP-2026) skipped PPA-997 and PPA-1563 with "status is 'To Do', not 'In
+Progress'", and PPA-1547 comment 29447 records the same skip on 18-SEP-2026 in
+peech-org-skills merge 22b4026.
+
+A merge is itself evidence the work started, so the To Do to In Progress hop is
+applied here and the key is then graded as if it had been found at In
+Progress. It stays visible on the outcome line rather than in a skip. A hop
+that fails is FAILED, and the key is not graded.
 
 The third outcome is the absence of a status
 ---------------------------------------------
@@ -84,8 +102,8 @@ Who learns that a ticket was held
 PPA-1534, as amended 22-SEP-2026. The held comment above lands on the ticket,
 and nothing reads a ticket nobody opens - so the one outcome that rejects work
 was the one outcome with no reader. Every held key now also sends a single
-Slack notice to the channel named by the ``SLACK_CHANNEL_DELIVERY_OPS``
-repository variable, carrying the key, the merge hash, the pull request and
+Slack notice to the channel the caller passes as merge-close-out.yml's
+``slack_channel`` input, carrying the key, the merge hash, the pull request and
 every condition the verdict table reported unmet or unstated.
 
 Nothing is sent for a routing to Done or to Client Validation, because neither
@@ -442,12 +460,14 @@ called and imported, never changed.
 
 import argparse
 import datetime
+import json
 import os
 import re
 import subprocess
 import sys
 import urllib.error
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -460,6 +480,10 @@ SCRIPT = Path(__file__).resolve().parent / "pt_transition.py"
 #: The only status this script transitions out of. Every other status is
 #: commented and skipped - see "Which status a merged key reaches" above.
 MERGED_FROM = "In Progress"
+
+#: The one other status a merged key is moved out of, and only onto
+#: MERGED_FROM - see "A merged key at To Do is walked forward" above.
+STARTED_FROM = "To Do"
 
 #: Where a merged key goes unless Auto-Done's four conditions all hold. Every
 #: failure path this file owns routes here, and none may produce Done.
@@ -1504,12 +1528,19 @@ def post_held(post, key, failures, comments, sha, dry_run=False):
 
 # ----------------------------------------------------- the held Slack notice
 
-#: The GitHub Actions repository variable naming the channel a held notice goes
-#: to. Read from the environment and never written into this file: the id is
+#: The environment variable naming the channel a held notice goes to, set by
+#: merge-close-out.yml from its slack_channel input (PPA-1601). Read from the
+#: environment and never written into this file: the id is
 #: configuration, it differs per repository, and this file is one of three
 #: registered copies (scripts/cross_repo_copies.py), so a literal here would
 #: ship one repository's channel into the other two.
 CHANNEL_VAR = "SLACK_CHANNEL_DELIVERY_OPS"
+
+#: The bot token the notice posts with. The caller passes it as a secret; with
+#: no token the notice is a reported skip, like an unset channel.
+TOKEN_VAR = "SLACK_BOT_TOKEN"
+
+SLACK_POST_URL = "https://slack.com/api/chat.postMessage"
 
 #: Who the notice tells a reader to tag, per pt-slack-message-design section
 #: Footer: the Space Lead, and Sean where none is defined. The close-out
@@ -1543,21 +1574,25 @@ def notice_text(key, failures, sha, pr_number):
             f"<@{NOTICE_TAG}> \u2014 I'll look into it._")
 
 
-def post_notice(channel_id, text):
-    """Post one notice to Slack.
+def post_notice(token, channel_id, text):
+    """Post one notice through Slack's chat.postMessage.
 
-    Ported from peech_shared.jobs.registry_reconcile._post_reconcile_notification,
-    down to the local import: pt-conduct-gates section Shared-First makes
-    peech_shared.slack.post_message the canonical Slack caller, and this wires
-    it rather than writing a second one. The import is local because every
-    other path through this file - every merge that transitions cleanly - has
-    to keep working where the shared package is not installed.
-
-    resolve_channel() is the is_test_mode()-gated primitive CLAUDE.md requires
-    every override target to route through.
+    PPA-1601. Plain urllib, like pt_transition.make_client, because a called
+    workflow's runner has no peech_shared: the earlier import of
+    peech_shared.slack failed on every run, so no notice was ever sent from
+    here. Slack reports a refused post as HTTP 200 carrying ``"ok": false``,
+    so that is raised too, not read as success.
     """
-    from peech_shared.slack import post_message, resolve_channel  # noqa: PLC0415
-    post_message(resolve_channel(channel_id), text)
+    req = urllib.request.Request(
+        SLACK_POST_URL,
+        data=json.dumps({"channel": channel_id, "text": text}).encode(),
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json; charset=utf-8"},
+        method="POST")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        body = json.loads(resp.read() or b"{}")
+    if not body.get("ok"):
+        raise RuntimeError(f"chat.postMessage refused: {body.get('error')}")
 
 
 def notify_held(key, failures, sha, pr_number, comments=(), dry_run=False):
@@ -1568,8 +1603,8 @@ def notify_held(key, failures, sha, pr_number, comments=(), dry_run=False):
     post_table raise nothing: where a merged ticket goes is this workflow's
     decision, and a Slack outage may not change it.
 
-    Two guards before the send. An unset channel variable is a skip rather than
-    an error, which is how registry_reconcile treats its own; and a merge whose
+    Three guards before the send. An unset channel or token is a skip rather
+    than an error, which is how registry_reconcile treats its own; and a merge whose
     held comment was already posted has already been announced, so a re-run of
     the same merge stays silent. That is the guard post_held uses, read against
     the comments as they were before this run wrote anything.
@@ -1578,11 +1613,14 @@ def notify_held(key, failures, sha, pr_number, comments=(), dry_run=False):
         channel = os.environ.get(CHANNEL_VAR, "").strip()
         if not channel:
             return f"no notice sent: {CHANNEL_VAR} is not set"
+        token = os.environ.get(TOKEN_VAR, "").strip()
+        if not token:
+            return f"no notice sent: {TOKEN_VAR} is not set"
         if held_already_posted(comments, sha):
             return "notice already sent for this merge"
         if dry_run:
             return f"would notify {channel}, naming {len(failures)} condition(s)"
-        post_notice(channel, notice_text(key, failures, sha, pr_number))
+        post_notice(token, channel, notice_text(key, failures, sha, pr_number))
     except Exception as exc:  # noqa: BLE001 - never fail a merge over a notice
         return f"notice not sent: {exc}"
     return f"notice sent to {channel}, naming {len(failures)} condition(s)"
@@ -1645,6 +1683,19 @@ def close_out(get, post, key, sha, pr_number, date, dry_run=False):
     table = safe_table(dod, comments)
     note = f"{note}; {post_table(post, key, table, comments, sha, dry_run)}"
 
+    # PPA-1601: a key at To Do is moved to In Progress, then graded as if it
+    # had been found there. A failed hop leaves it at To Do, ungraded.
+    if norm(status) == norm(STARTED_FROM):
+        hop = f"{STARTED_FROM!r} to {MERGED_FROM!r} first"
+        if dry_run:
+            note = f"{note}; would move {hop}"
+        else:
+            moved, said = fire(key, MERGED_FROM)
+            if not moved:
+                return Outcome(key, "FAILED", f"{note}; {hop} failed - {said}")
+            note = f"{note}; moved {hop}"
+        status = MERGED_FROM
+
     target, reason, failures = plan_transition(status, table)
     if failures:
         # The third outcome, PPA-1518: graded, failed, and deliberately left
@@ -1662,12 +1713,20 @@ def close_out(get, post, key, sha, pr_number, date, dry_run=False):
         return Outcome(key, "COMMENTED",
                        f"{note}; would move to {target!r} - {reason}")
 
+    moved, said = fire(key, target)
+    return Outcome(key, "MOVED" if moved else "FAILED",
+                   f"{note}; {target!r} - {said}")
+
+
+def fire(key, target):
+    """Move one key to ``target`` through pt_transition.py.
+
+    Returns (moved, what the script said)."""
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), "--keys", key, "--to", target],
         capture_output=True, text=True)
-    verdict = "MOVED" if proc.returncode == 0 else "FAILED"
     said = (proc.stdout.strip() or proc.stderr.strip() or "no output")
-    return Outcome(key, verdict, f"{note}; {target!r} - {said}")
+    return proc.returncode == 0, said
 
 
 def run(get, post, keys, sha, pr_number, date, dry_run=False):

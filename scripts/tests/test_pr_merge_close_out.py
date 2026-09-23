@@ -319,29 +319,60 @@ def test_the_issue_read_no_longer_asks_for_labels(never_shell_out):
     assert "status" in stub.gets[0] and "comment" in stub.gets[0]
 
 
-def test_a_key_at_to_do_is_commented_but_not_transitioned(never_shell_out):
-    """A key still at To Do is the signal that the UserPromptSubmit hook did
-    not fire. It has to stay visible in the skip line rather than be quietly
-    corrected, which is why the rule does not simply walk it forward."""
-    assert plan_transition("To Do")[0] is None
-
-    stub = StubJira(status="To Do")
+def test_a_key_at_to_do_all_met_moves_to_in_progress_then_done(never_shell_out):
+    """PPA-1601. No UserPromptSubmit hook runs in a repository that calls this
+    workflow, so a merged key at To Do is moved to In Progress first and then
+    routed exactly as it would be from there."""
+    stub = StubJira(status="To Do", dod=ALL_MACHINE, comments=ALL_MET)
     outcomes = run(stub.get, stub.post, ["PPA-1"], SHA, "3", DATE)
 
-    assert outcomes[0].verdict == "SKIPPED"
-    assert "'To Do'" in outcomes[0].detail, "the skip line names the status found"
-    assert "not transitioned" in outcomes[0].detail
-    assert never_shell_out == [], "a skipped key fires no transition"
-    assert len(stub.posts) == 1, "it is still commented"
-    # Was 0 until PPA-1464. A skip is still not a failure - it is PARTIAL_EXIT
-    # rather than FAILED_EXIT - but it is no longer plain success either, since
-    # a green run is what stopped anyone reading the skip line this test exists
-    # to keep visible.
-    assert exit_code(outcomes) == PARTIAL_EXIT, "a skip is not plain success"
-    assert exit_code(outcomes) != FAILED_EXIT, "a skip is not a failure either"
+    assert [argv[-1] for argv in never_shell_out] == ["In Progress", "Done"]
+    assert outcomes[0].verdict == "MOVED"
+    assert "moved 'To Do' to 'In Progress' first" in outcomes[0].detail, (
+        "the outcome line still says the key started at To Do")
+    assert exit_code(outcomes) == OK
 
 
-@pytest.mark.parametrize("status", ["Done", "Client Validation", "BLOCKED"])
+def test_a_key_at_to_do_with_an_unmet_condition_moves_to_in_progress_and_is_held(
+        never_shell_out):
+    stub = StubJira(status="To Do", dod=ALL_MACHINE, comments=MACHINE_ONE_UNMET)
+    outcomes = run(stub.get, stub.post, ["PPA-1"], SHA, "3", DATE)
+
+    assert [argv[-1] for argv in never_shell_out] == ["In Progress"]
+    assert outcomes[0].verdict == "HELD"
+    assert held_posted(stub) is not None
+    assert exit_code(outcomes) == PARTIAL_EXIT
+
+
+def test_a_failed_to_do_hop_is_failed_and_the_key_is_not_graded(monkeypatch):
+    calls = []
+
+    def refused(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 1, stdout="PPA-1 HALT\n", stderr="")
+
+    monkeypatch.setattr(closeout.subprocess, "run", refused)
+    stub = StubJira(status="To Do", dod=ALL_MACHINE, comments=ALL_MET)
+    outcomes = run(stub.get, stub.post, ["PPA-1"], SHA, "3", DATE)
+
+    assert [argv[-1] for argv in calls] == ["In Progress"], (
+        "nothing past the failed hop was fired")
+    assert outcomes[0].verdict == "FAILED"
+    assert "'To Do' to 'In Progress' first failed - PPA-1 HALT" in outcomes[0].detail
+    assert exit_code(outcomes) == FAILED_EXIT
+
+
+def test_a_dry_run_at_to_do_fires_nothing(never_shell_out):
+    stub = StubJira(status="To Do", dod=ALL_MACHINE, comments=ALL_MET)
+    outcomes = run(stub.get, stub.post, ["PPA-1"], SHA, "3", DATE, dry_run=True)
+
+    assert never_shell_out == []
+    assert "would move 'To Do' to 'In Progress' first" in outcomes[0].detail
+    assert "would move to 'Done'" in outcomes[0].detail
+
+
+@pytest.mark.parametrize("status", ["Done", "Client Validation", "Reopened",
+                                    "BLOCKED"])
 def test_every_other_status_is_commented_and_skipped(status, never_shell_out):
     stub = StubJira(status=status)
     outcomes = run(stub.get, stub.post, ["PPA-1"], SHA, "3", DATE)
@@ -1436,9 +1467,10 @@ def test_a_stacked_squash_finds_both_tickets_it_carried():
 def test_no_key_a_stacked_squash_carried_is_dropped_unnamed(
         monkeypatch, capsys, never_shell_out):
     """Condition 4. Either a carried key is transitioned, or it is named in the
-    output with the reason - never neither. PPA-1456 is at To Do here, so it is
-    found, skipped, and reported rather than silently left behind."""
-    statuses = {"PPA-1459": "In Progress", "PPA-1456": "To Do"}
+    output with the reason - never neither. PPA-1456 is at Client Validation
+    here, so it is found, skipped, and reported rather than silently left
+    behind. It was To Do until PPA-1601, which walks a To Do key forward."""
+    statuses = {"PPA-1459": "In Progress", "PPA-1456": "Client Validation"}
 
     def get(path):
         key = path.split("/")[2].split("?")[0]
@@ -1458,7 +1490,8 @@ def test_no_key_a_stacked_squash_carried_is_dropped_unnamed(
     assert "NOT TRANSITIONED: 1 of 2 key(s)" in out
     assert "PPA-1456" in out.split("NOT TRANSITIONED")[1], (
         "the key it carried and did not move is named after the heading")
-    assert "'To Do'" in out, "and the reason it was not moved rides with it"
+    assert "'Client Validation'" in out, (
+        "and the reason it was not moved rides with it")
 
 
 def _post(path, payload):
@@ -2100,7 +2133,7 @@ def test_held_is_distinct_from_skipped(never_shell_out):
     failed. Collapsing them would hide the case this ticket exists for."""
     graded = StubJira(status="In Progress", dod=ALL_MACHINE,
                       comments=MACHINE_ONE_UNMET)
-    ungraded = StubJira(status="To Do", dod=ALL_MACHINE,
+    ungraded = StubJira(status="Client Validation", dod=ALL_MACHINE,
                         comments=MACHINE_ONE_UNMET)
 
     held = run(graded.get, graded.post, ["PPA-1"], SHA, "3", DATE)[0]
@@ -2541,6 +2574,7 @@ def test_the_module_states_the_two_checklist_rule_exactly_once():
 # --------------------------------------------------------------------------
 
 CHANNEL = "C0DELIVERYOPS"
+TOKEN = "test-bot-token"
 
 #: A Definition of Done that cannot reach Done, so its close-out routes to
 #: Client Validation however many conditions it reports met.
@@ -2555,14 +2589,14 @@ CONDUCTOR_ALL_MET = [close_out("Definition of Done, condition by condition.",
 def notices(monkeypatch):
     """Capture what post_notice would send, and name a channel to send it to.
 
-    Patching post_notice rather than peech_shared keeps this suite free of
-    slack_sdk: the shared package is installed for the workflow, not for the
-    tests, and a suite that imported it would fail where it is absent.
+    The HTTP call itself is asserted through a stubbed urlopen in the
+    PPA-1601 tests below.
     """
     sent = []
     monkeypatch.setenv(closeout.CHANNEL_VAR, CHANNEL)
+    monkeypatch.setenv(closeout.TOKEN_VAR, TOKEN)
     monkeypatch.setattr(closeout, "post_notice",
-                        lambda channel, text: sent.append((channel, text)))
+                        lambda token, channel, text: sent.append((channel, text)))
     return sent
 
 
@@ -2629,27 +2663,99 @@ def test_every_outcome_the_module_produces_is_covered(never_shell_out, notices):
     assert sent == {"held": 1, "Done": 0, "Client Validation": 0}
 
 
-def test_a_raising_slack_call_leaves_the_outcome_and_the_exit_code_alone(
+class FakeSlack:
+    """Stands in for urllib.request.urlopen: records each request, answers ok."""
+
+    def __init__(self, reply=b'{"ok": true}'):
+        self.reply = reply
+        self.requests = []
+
+    def __call__(self, req, timeout=None):
+        self.requests.append(req)
+        reply = self.reply
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return reply
+
+        return Response()
+
+
+def test_a_held_key_posts_one_chat_post_message_carrying_notice_text(
     never_shell_out, monkeypatch
+):
+    """PPA-1601. The notice goes out through chat.postMessage with urllib, and
+    its text is notice_text() unchanged."""
+    monkeypatch.setenv(closeout.CHANNEL_VAR, CHANNEL)
+    monkeypatch.setenv(closeout.TOKEN_VAR, TOKEN)
+    slack = FakeSlack()
+    monkeypatch.setattr(closeout.urllib.request, "urlopen", slack)
+    stub = StubJira(status="In Progress", dod=ALL_MACHINE,
+                    comments=MACHINE_ONE_UNMET)
+
+    outcomes = run(stub.get, stub.post, ["PPA-1"], SHA, "90", DATE)
+
+    assert len(slack.requests) == 1
+    req, = slack.requests
+    assert req.full_url == "https://slack.com/api/chat.postMessage"
+    assert req.get_method() == "POST"
+    assert req.get_header("Authorization") == f"Bearer {TOKEN}"
+    table = closeout.build_table(ALL_MACHINE, MACHINE_ONE_UNMET)
+    failures = [(r[0], r[1]) for r in table.unmet]
+    assert json.loads(req.data) == {
+        "channel": CHANNEL,
+        "text": closeout.notice_text("PPA-1", failures, SHA, "90")}
+    assert f"notice sent to {CHANNEL}" in outcomes[0].detail
+
+
+@pytest.mark.parametrize("failure", ["raises", "ok false"])
+def test_a_raising_slack_call_leaves_the_outcome_and_the_exit_code_alone(
+    never_shell_out, monkeypatch, failure
 ):
     """Named test 4. Where a merged ticket goes is this workflow's decision and
     a Slack outage may not change it - so the verdict, the exit code and the
-    held comment all have to survive the raise."""
+    held comment all have to survive the raise. Slack's own refusal, HTTP 200
+    carrying "ok": false, is the same case."""
     monkeypatch.setenv(closeout.CHANNEL_VAR, CHANNEL)
+    monkeypatch.setenv(closeout.TOKEN_VAR, TOKEN)
 
-    def explode(channel, text):
-        raise RuntimeError("chat.postMessage failed: channel_not_found")
+    def explode(req, timeout=None):
+        raise closeout.urllib.error.URLError("slack.com unreachable")
 
-    monkeypatch.setattr(closeout, "post_notice", explode)
+    monkeypatch.setattr(closeout.urllib.request, "urlopen", explode if (
+        failure == "raises") else FakeSlack(b'{"ok": false, "error": "channel_not_found"}'))
+    stub = StubJira(status="In Progress", dod=ALL_MACHINE,
+                    comments=MACHINE_ONE_UNMET)
+
+    outcomes = run(stub.get, stub.post, ["PPA-1"], SHA, "90", DATE)
+
+    assert never_shell_out == [], "the routing changed"
+    assert outcomes[0].verdict == "HELD"
+    assert exit_code(outcomes) == PARTIAL_EXIT
+    assert held_posted(stub) is not None, "the held comment was lost to Slack"
+    assert "notice not sent:" in outcomes[0].detail
+
+
+def test_an_unset_token_skips_the_notice_without_failing(
+    never_shell_out, monkeypatch
+):
+    monkeypatch.setenv(closeout.CHANNEL_VAR, CHANNEL)
+    monkeypatch.delenv(closeout.TOKEN_VAR, raising=False)
+    monkeypatch.setattr(closeout.urllib.request, "urlopen", lambda *a, **k: (
+        pytest.fail("posted with no token")))
     stub = StubJira(status="In Progress", dod=ALL_MACHINE,
                     comments=MACHINE_ONE_UNMET)
 
     outcomes = run(stub.get, stub.post, ["PPA-1"], SHA, "90", DATE)
 
     assert outcomes[0].verdict == "HELD"
-    assert exit_code(outcomes) == PARTIAL_EXIT
-    assert held_posted(stub) is not None, "the held comment was lost to Slack"
-    assert "notice not sent: chat.postMessage failed" in outcomes[0].detail
+    assert f"no notice sent: {closeout.TOKEN_VAR} is not set" in outcomes[0].detail
 
 
 def test_the_notice_is_sent_after_the_held_comment(never_shell_out, monkeypatch):
@@ -2657,8 +2763,9 @@ def test_the_notice_is_sent_after_the_held_comment(never_shell_out, monkeypatch)
     because "after" is the property that keeps a Slack failure harmless."""
     order = []
     monkeypatch.setenv(closeout.CHANNEL_VAR, CHANNEL)
+    monkeypatch.setenv(closeout.TOKEN_VAR, TOKEN)
     monkeypatch.setattr(closeout, "post_notice",
-                        lambda channel, text: order.append("notice"))
+                        lambda token, channel, text: order.append("notice"))
     stub = StubJira(status="In Progress", dod=ALL_MACHINE,
                     comments=MACHINE_ONE_UNMET)
     real_post = stub.post
@@ -2690,7 +2797,7 @@ def test_an_unset_channel_variable_skips_the_notice_without_failing(
     """An unconfigured repository is a skip rather than an error - the same
     call registry_reconcile makes about its own channel variable."""
     monkeypatch.delenv(closeout.CHANNEL_VAR, raising=False)
-    monkeypatch.setattr(closeout, "post_notice", lambda channel, text: (
+    monkeypatch.setattr(closeout, "post_notice", lambda token, channel, text: (
         pytest.fail("posted with no channel configured")))
     stub = StubJira(status="In Progress", dod=ALL_MACHINE,
                     comments=MACHINE_ONE_UNMET)
@@ -2760,17 +2867,23 @@ def test_the_regrade_sweep_sends_no_notice(never_shell_out, notices):
     assert notices == []
 
 
-def test_the_workflow_passes_the_channel_variable_and_the_token():
-    """Condition 4's other half: the variable name read here is the one the
-    workflow supplies, and it comes from `vars`, not from a literal."""
+def test_the_workflow_passes_the_channel_input_and_the_token():
+    """Condition 4's other half, as changed by PPA-1601: the channel comes from
+    the caller's optional slack_channel input, the token from an optional
+    secret, and neither is a literal in the file."""
     import yaml
 
     root = Path(closeout.__file__).resolve().parents[1]
-    workflow = yaml.safe_load(
-        (root / ".github/workflows/merge-close-out.yml").read_text())
+    text = (root / ".github/workflows/merge-close-out.yml").read_text()
+    workflow = yaml.safe_load(text)
+    call = workflow[True]["workflow_call"]  # PyYAML reads the key `on` as True
     step, = [s for s in workflow["jobs"]["close-out"]["steps"]
              if "pr_merge_close_out.py" in (s.get("run") or "")]
 
-    assert step["env"][closeout.CHANNEL_VAR] == (
-        "${{ vars." + closeout.CHANNEL_VAR + " }}")
-    assert step["env"]["SLACK_BOT_TOKEN"] == "${{ secrets.SLACK_BOT_TOKEN }}"
+    assert call["inputs"]["slack_channel"]["required"] is False
+    assert call["inputs"]["slack_channel"]["type"] == "string"
+    assert call["secrets"]["SLACK_BOT_TOKEN"]["required"] is False
+    assert step["env"][closeout.CHANNEL_VAR] == "${{ inputs.slack_channel }}"
+    assert step["env"][closeout.TOKEN_VAR] == "${{ secrets.SLACK_BOT_TOKEN }}"
+    assert not re.search(r"xox[abprs]-", text), "a Slack token is in the file"
+    assert not re.search(r"\bC0[A-Z0-9]{6,}\b", text), "a channel id is in the file"
