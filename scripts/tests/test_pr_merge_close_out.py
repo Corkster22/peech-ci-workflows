@@ -471,8 +471,9 @@ def test_the_workflow_exists_at_the_repo_root_and_is_callable():
 
     PPA-1577. In peech-pmo-automation this test asserts the push trigger and
     the re-grade sweep. Here the workflow is called, not triggered: the caller
-    runs it on push to main and passes its Jira pair as secrets, and the sweep
-    stays in peech-pmo-automation.
+    runs it on push to main and passes its Jira pair as secrets. PPA-1614 added
+    the sweep as a second job, run when the caller passes regrade true; see
+    test_merge_close_out_regrade.py.
     """
     import yaml
 
@@ -484,7 +485,7 @@ def test_the_workflow_exists_at_the_repo_root_and_is_callable():
     assert secrets["JIRA_EMAIL"] == {"required": True}
     assert secrets["JIRA_API_TOKEN"] == {"required": True}
     assert secrets["SLACK_BOT_TOKEN"] == {"required": False}
-    assert list(workflow["jobs"]) == ["close-out"]
+    assert list(workflow["jobs"]) == ["close-out", "regrade-held"]
     assert "python .peech-ci-workflows/scripts/pr_merge_close_out.py\n" in (
         WORKFLOW.read_text(encoding="utf-8"))
 

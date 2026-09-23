@@ -15,7 +15,9 @@ name: Merge Close-Out — Record
 # and GITHUB_REF to recognise a close-out run, so a caller under another name or
 # trigger is refused the In Progress to Done hop.
 #
-# No re-grade sweep here: peech-pmo-automation's hourly schedule stays there.
+# PPA-1614. The re-grade runs when a caller passes `regrade: true` from its
+# schedule trigger, as `regrade: ${{ github.event_name == 'schedule' }}`. Each
+# job takes exactly one value of that input, so one caller file serves both.
 
 permissions:
   contents: read
@@ -30,6 +32,12 @@ on:
         type: string
         required: false
         default: ""
+      # PPA-1614. True runs the re-grade sweep instead of a close-out. The
+      # sweep finds its own keys, so it needs no merge to read.
+      regrade:
+        type: boolean
+        required: false
+        default: false
     secrets:
       JIRA_EMAIL:
         required: true
@@ -44,6 +52,7 @@ on:
 jobs:
   close-out:
     name: Comment the hash and transition
+    if: ${{ !inputs.regrade }}
     runs-on: ubuntu-latest
 
     steps:
@@ -104,3 +113,47 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_DELIVERY_OPS: ${{ inputs.slack_channel }}
         run: python .peech-ci-workflows/scripts/pr_merge_close_out.py
+
+  regrade-held:
+    name: Re-grade every ticket a merge left held
+    if: ${{ inputs.regrade }}
+    runs-on: ubuntu-latest
+
+    steps:
+      # No caller checkout: the sweep reads no merge, only Jira.
+      - name: Checkout peech-ci-workflows
+        uses: actions/checkout@v6
+        with:
+          repository: Corkster22/peech-ci-workflows
+          ref: main
+          path: .peech-ci-workflows
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # The close-out job's step, unchanged; see the note there.
+      - name: Materialise the credential file pt_transition.py reads
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${JIRA_EMAIL}" ] || [ -z "${JIRA_API_TOKEN}" ]; then
+            echo "JIRA_EMAIL or JIRA_API_TOKEN was not passed by the caller"
+            exit 1
+          fi
+          target="${HOME}/Documents/Claude-Projects/peech-pmo-automation/secrets"
+          mkdir -p "${target}"
+          umask 077
+          {
+            printf 'JIRA_EMAIL=%s\n' "${JIRA_EMAIL}"
+            printf 'JIRA_API_TOKEN=%s\n' "${JIRA_API_TOKEN}"
+          } > "${target}/.env"
+          echo "wrote ${target}/.env"
+
+      # PPA-1556. plan_transition() owns the rule, as it does for the
+      # close-out. No Slack env is passed: the re-grade sends no notice.
+      - name: Re-grade the held set
+        run: python .peech-ci-workflows/scripts/pr_merge_close_out.py --regrade

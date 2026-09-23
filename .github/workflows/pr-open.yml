@@ -313,4 +313,144 @@ jobs:
           opened=$(gh pr list --repo "${REPO}" --head "${HEAD_REF}" \
             --state open --json number --jq '.[0].number // ""')
           echo "OPENED: pull request #${opened} for '${HEAD_REF}'."
-          echo "Arming is auto-merge-arm.yml's job, not this one."
+          echo "The arm job below arms it once the branch settles; the"
+          echo "auto-merge-arm.yml sweep is the fallback."
+
+  # Arm the pull request this push produced — PPA-1611
+  # ---------------------------------------------------
+  # Ported from peech-skills' pr-open.yml at origin/main 869d9f0, the PPA-1435
+  # job (352848b). That header carries the measurements: the scheduled sweep
+  # fired 22 times against 169 expected over 84.6 hours on 16-SEP-2026, while a
+  # push is an event GitHub does not drop. So the push arms first and the sweep
+  # in auto-merge-arm.yml is the fallback for any branch this path misses.
+  #
+  # The PPA-1391 race stays closed by the concurrency block, not by the wait: a
+  # second push cancels the first push's pending arm, so only the last push's
+  # job arms. The settle wait and the head re-read after it cover a push that
+  # lands between this job's read and its arm call. A push after the merge has
+  # already fired is not prevented; it is recorded as `already-merged`, loudly.
+  #
+  # Why six minutes: PPA-1435 required arming within ten minutes of the push.
+  # Six leaves margin for queue time, and a longer wait trades against that bar.
+  #
+  # One adaptation. peech-skills declares `contents: write` on this job; here
+  # it declares `contents: read`, because a called workflow cannot hold more
+  # than its caller grants and peech-org-skills grants `contents: read`. Nothing
+  # is lost: `gh pr merge --auto` runs under PEECH_AUTOMATION_TOKEN, not
+  # GITHUB_TOKEN, so the job token's scopes never reach the arm call.
+  arm:
+    name: Arm this branch's pull request once the branch settles
+    needs: open
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    # The whole race guard. A later push to the same branch cancels this job
+    # before it arms, so the surviving run is always the last push's.
+    concurrency:
+      group: pr-arm-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      # No checkout. Nothing here reads the repository.
+      - name: Settle, then arm this branch's pull request, or record why not
+        env:
+          GH_TOKEN: ${{ secrets.PEECH_AUTOMATION_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_REF: ${{ github.ref_name }}
+          PUSHED_SHA: ${{ github.sha }}
+          # How long the branch must settle before arming. See the note above
+          # before changing it: it trades against the ten-minute bar.
+          ARM_SETTLE_MINUTES: 6
+        run: |
+          set -euo pipefail
+
+          # Condition 4 of PPA-1435 — every arming attempt writes a record with
+          # its outcome, success or failure. `record` is the only way this step
+          # reports, so there is no path through it that ends silently. The job
+          # summary is the queryable half: `gh run view --json ...` and the
+          # Actions UI both read it without opening a log.
+          #
+          # PPA-1611, considered and dropped: actionlint's shellcheck flags the
+          # backticks below as SC2016 (info). They are Markdown code spans for
+          # the job summary and are meant literally, so nothing breaks.
+          record() {
+            outcome="$1"; shift
+            printf 'arm-attempt outcome=%s branch=%s sha=%s %s\n' \
+              "${outcome}" "${HEAD_REF}" "${PUSHED_SHA}" "$*"
+            printf '| `%s` | `%s` | `%s` | %s |\n' \
+              "${outcome}" "${HEAD_REF}" "${PUSHED_SHA:0:7}" "$*" \
+              >> "${GITHUB_STEP_SUMMARY}"
+          }
+
+          printf '| outcome | branch | sha | detail |\n|---|---|---|---|\n' \
+            >> "${GITHUB_STEP_SUMMARY}"
+
+          # PPA-1279 — fail loudly on a missing secret, no GITHUB_TOKEN
+          # fallback. See the pr-open step above for why.
+          if [ -z "${GH_TOKEN:-}" ]; then
+            record "no-token" "PEECH_AUTOMATION_TOKEN is empty or absent."
+            echo "::error::PEECH_AUTOMATION_TOKEN is empty or absent on this repository."
+            exit 1
+          fi
+
+          echo "settling ${ARM_SETTLE_MINUTES}m before arming '${HEAD_REF}'."
+          echo "a further push to this branch cancels this job before it arms."
+          sleep $(( ARM_SETTLE_MINUTES * 60 ))
+
+          # Re-read after the wait rather than trusting the pre-wait state.
+          pr=$(gh pr list --repo "${REPO}" --head "${HEAD_REF}" --state all \
+            --limit 1 --json number,state,headRefOid,isDraft,mergeable,autoMergeRequest)
+
+          number=$(printf '%s' "${pr}" | jq -r '.[0].number // ""')
+          if [ -z "${number}" ]; then
+            record "no-pull-request" "no pull request exists for this branch; the sweep will catch it."
+            exit 0
+          fi
+
+          state=$(printf '%s' "${pr}" | jq -r '.[0].state')
+          oid=$(printf '%s' "${pr}" | jq -r '.[0].headRefOid')
+          draft=$(printf '%s' "${pr}" | jq -r '.[0].isDraft')
+          already=$(printf '%s' "${pr}" | jq -r '.[0].autoMergeRequest != null')
+
+          # The PPA-1391 strand, made loud. This push's commit is on a branch
+          # whose pull request has already merged without it, so the work in
+          # PUSHED_SHA has shipped nowhere and nothing else would say so.
+          if [ "${state}" = "MERGED" ]; then
+            record "already-merged" "pull request #${number} merged without ${PUSHED_SHA}; that commit is stranded."
+            echo "::error::pull request #${number} for '${HEAD_REF}' has already merged."
+            echo "Commit ${PUSHED_SHA} is not in it and has no open pull request behind it."
+            echo "Open a follow-up branch for it — this is the PPA-1391 strand."
+            exit 1
+          fi
+
+          if [ "${state}" != "OPEN" ]; then
+            record "not-open" "pull request #${number} is ${state}."
+            exit 0
+          fi
+
+          # The head moved while this job waited and cancellation did not reach
+          # it. The later push has its own run; that one arms.
+          if [ "${oid}" != "${PUSHED_SHA}" ]; then
+            record "head-moved" "branch head is now ${oid}, not ${PUSHED_SHA}; that push's own run arms it."
+            exit 0
+          fi
+
+          if [ "${draft}" = "true" ]; then
+            record "draft" "pull request #${number} is a draft; mark it ready and the sweep arms it."
+            exit 0
+          fi
+
+          if [ "${already}" = "true" ]; then
+            record "already-armed" "pull request #${number} was already armed."
+            exit 0
+          fi
+
+          if gh pr merge "${number}" --repo "${REPO}" --auto --squash; then
+            record "armed" "pull request #${number} armed; the required checks decide the merge."
+          else
+            record "arm-failed" "could not arm pull request #${number}; the sweep will retry."
+            echo "::warning::could not arm pull request #${number}; auto-merge-arm.yml will retry."
+          fi
