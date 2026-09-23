@@ -21,7 +21,7 @@ PeechTech-Framework-SharedAutomationRouting in peech-pmo-automation.
 | Path | Holds |
 |---|---|
 | `.github/workflows/merge-close-out.yml` | Callable. Records the merge hash on each PPA key a merge carried and applies the close-out transition. |
-| `.github/workflows/pr-open.yml` | Callable. Opens the pull request for a pushed `ppa-*` branch. |
+| `.github/workflows/pr-open.yml` | Callable. Opens the pull request for a pushed `ppa-*` branch and arms it once the branch settles. |
 | `.github/workflows/auto-merge-arm.yml` | Callable. Arms auto-merge on a quiet pull request. |
 | `.github/workflows/behind-branch-update.yml` | Callable. Updates a pull request that is behind `main`. |
 | `.github/workflows/pytest.yml` | This repository's own check, on pull request and on push to `main`. |

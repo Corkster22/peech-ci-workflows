@@ -17,8 +17,11 @@ name: Auto-Merge — Arm
 # auto-merge-arm.yml at origin/main 1dcd48e, the PPA-1435 change (352848b,
 # 16-SEP-2026): an armed pull request whose base is CONFLICTING fails the sweep,
 # naming the pull request, because auto-merge waits on a conflict forever
-# rather than failing it. The arm job PPA-1435 added to peech-skills'
-# pr-open.yml is not ported; the sweep is the standard here.
+# rather than failing it.
+#
+# PPA-1611. The push-arm is the first mover: the arm job in the callable
+# pr-open.yml, ported from PPA-1435, arms each pushed branch's pull request
+# once the branch settles. This sweep is the fallback for any it misses.
 
 permissions:
   contents: write
