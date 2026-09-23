@@ -1,0 +1,316 @@
+name: Pull Request — Open
+
+# PPA-1590. peech-pmo-automation's pr-open.yml at origin/main fadfc00, served as
+# a callable workflow. The header history lives in that copy; the steps and
+# their rules are unchanged. The caller keeps its own `push` to `ppa-*` trigger
+# and passes its own credentials; no secret is stored here.
+#
+# Two adaptations, both forced by workflow_call rather than chosen:
+#
+#   * The caller's jira-credentials composite action cannot be reached from
+#     here, and peech-skills has none. The Jira pair arrives as secrets and is
+#     read in the materialise step's own env, as merge-close-out.yml here does.
+#     The Tempo inputs that action took existed for peech_shared.jira's import
+#     coupling; pt_transition.py imports only the standard library.
+#   * pt_transition.py runs from a checkout of this repository, beside the
+#     caller's checkout, so the caller stops carrying a copy of it.
+#
+# The github context of a called workflow is the caller's, so github.ref_name,
+# github.repository and the git history below are all the caller's.
+
+permissions:
+  contents: read
+  pull-requests: write
+
+on:
+  workflow_call:
+    secrets:
+      PEECH_AUTOMATION_TOKEN:
+        required: true
+      # Optional because an absent pair warns and skips the start hop rather
+      # than failing the job; see the materialise step.
+      JIRA_EMAIL:
+        required: false
+      JIRA_API_TOKEN:
+        required: false
+
+jobs:
+  open:
+    name: Open a pull request for this branch if none exists
+    runs-on: ubuntu-latest
+
+    steps:
+      # fetch-depth 0 so `origin/main..HEAD` resolves. A shallow clone has no
+      # merge base, and the ahead-count guard below would then read zero on
+      # every branch and skip the open it exists to perform.
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Checkout peech-ci-workflows
+        uses: actions/checkout@v6
+        with:
+          repository: Corkster22/peech-ci-workflows
+          ref: main
+          path: .peech-ci-workflows
+
+      # The start hop runs in its own steps, ahead of the open below, for two
+      # reasons. A push whose pull request already exists exits the open step at
+      # guard 2, and the hop has to fire on every push rather than only the
+      # first. And a hop applied before the pull request exists cannot race the
+      # merge — PR #155 went from push to merge in 21 seconds, so that race is
+      # real rather than theoretical.
+      #
+      # Matching merge-close-out.yml's pattern: pt_transition.py holds one
+      # absolute credential path by design (PPA-1126), so the two variables it
+      # needs are written to that path here. No secret is created or rotated.
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # Unlike merge-close-out.yml and unlike the GH_TOKEN guard below, an
+      # absent secret warns and continues rather than failing the job. The
+      # difference is what each job exists to do: closing out a merge IS
+      # merge-close-out.yml's purpose, so it has nothing left to do without a
+      # credential, whereas this job exists to open a pull request and the hop
+      # is additional. A ticket left in To Do is the defect PPA-1350 closes; a
+      # pull request that never opens is worse.
+      - name: Materialise the credential file pt_transition.py reads
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ -z "${JIRA_EMAIL:-}" ] || [ -z "${JIRA_API_TOKEN:-}" ]; then
+            echo "::warning::JIRA_EMAIL or JIRA_API_TOKEN is absent on this"
+            echo "repository, so the To Do -> In Progress hop will be skipped."
+            echo "The pull request still opens. See PPA-1350."
+            exit 0
+          fi
+          target="${HOME}/Documents/Claude-Projects/peech-pmo-automation/secrets"
+          mkdir -p "${target}"
+          umask 077
+          {
+            printf 'JIRA_EMAIL=%s\n' "${JIRA_EMAIL}"
+            printf 'JIRA_API_TOKEN=%s\n' "${JIRA_API_TOKEN}"
+          } > "${target}/.env"
+          echo "wrote ${target}/.env"
+
+      # No transition ID appears here, and none may be added. pt_transition.py
+      # reads the issue's live status, reads the transition set actually offered
+      # from it, and matches by workflow label — IDs are configuration and the
+      # one pinned in prose was already wrong once (PPA-1021).
+      #
+      # Idempotence comes from that script too: a key already at In Progress, or
+      # past it at Client Validation or Done, is reported NOOP with its current
+      # status named and no write is attempted. Only a key in To Do moves.
+      #
+      # `set -e` is deliberately absent so a Jira failure prints its verdict
+      # lines and an exit code rather than killing the step mid-log, and
+      # continue-on-error is the backstop for anything that could still fail
+      # outside the script — a missing interpreter, a checkout without history.
+      # Both are here because they cover different failures.
+      #
+      # The keys are re-derived rather than shared with the open step below.
+      # Passing them between steps would couple the two, and a failure here
+      # would then cost the pull request its body.
+      - name: Move this branch's own PPA key to In Progress
+        continue-on-error: true
+        env:
+          HEAD_REF: ${{ github.ref_name }}
+        run: |
+          set -uo pipefail
+
+          creds="${HOME}/Documents/Claude-Projects/peech-pmo-automation/secrets/.env"
+          if [ ! -f "${creds}" ]; then
+            echo "SKIP: no credential file at ${creds}."
+            echo "The step above logged why. No key was transitioned."
+            exit 0
+          fi
+
+          # PPA-1375 — the key comes from the branch name, matching the title
+          # derivation PPA-1285 put in the open step below. A commit body citing
+          # a ticket as provenance is indistinguishable from one naming its own
+          # work, so scanning commit bodies transitioned every cited ticket too.
+          # There is deliberately no fallback to that scan: a branch with no key
+          # in its name transitions nothing.
+          key=$(printf '%s' "${HEAD_REF}" | grep -oiE 'ppa-[0-9]+' | head -1 \
+            | tr '[:lower:]' '[:upper:]' || true)
+          if [ -z "${key}" ]; then
+            echo "SKIP: branch '${HEAD_REF}' carries no PPA key in its name."
+            echo "Nothing to transition."
+            exit 0
+          fi
+
+          echo "branch key: ${key}"
+          echo "target status: 'In Progress'"
+          echo "--- pt_transition.py, one verdict line per key ---"
+          python3 .peech-ci-workflows/scripts/pt_transition.py --keys "${key}" --to "In Progress"
+          echo "--- EXIT: $? ---"
+          echo "PASS moved the key; NOOP means it was already at or past"
+          echo "In Progress; HALT means Jira refused and the key did not move."
+
+      # Guards are shell conditions, not a job-level `if:`. A job skipped by
+      # `if:` writes no log at all, and each skip here has to say why — a branch
+      # with no pull request and no explanation is the case a reader would
+      # otherwise have to diagnose.
+      #
+      # Every value arrives through `env:` rather than being interpolated into
+      # the shell, so nothing a branch name contains can be expanded or
+      # executed. Commit text reaches `gh` through a file and a quoted
+      # variable, never through a shell expansion.
+      - name: Open the pull request, or log why not
+        env:
+          GH_TOKEN: ${{ secrets.PEECH_AUTOMATION_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # PPA-1278 — fail loudly on a missing secret. There is deliberately no
+          # fallback to GITHUB_TOKEN: a fallback would restore the suppressed
+          # attribution, the merge would raise no event, merge-close-out.yml
+          # would not run, and the ticket would strand with nothing in any log
+          # saying why. That invisibility is the defect, so an absent secret
+          # stops the job instead.
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::PEECH_AUTOMATION_TOKEN is empty or absent on this repository."
+            echo "This workflow does not fall back to GITHUB_TOKEN — see the header"
+            echo "comment and PPA-1278. Add the secret, then re-run this job."
+            exit 1
+          fi
+
+          echo "branch: ${HEAD_REF}"
+
+          # Guard 1 — the branch name matches ppa-*. The caller's `branches:`
+          # filter already enforces this; the guard stays because a filter and a
+          # rule are different things, and this job should refuse a branch it
+          # was somehow handed rather than assume the trigger vouched for it.
+          case "${HEAD_REF}" in
+            ppa-*) ;;
+            *)
+              echo "SKIP: branch '${HEAD_REF}' does not match ppa-*."
+              echo "Only ticket branches get a pull request opened for them."
+              exit 0
+              ;;
+          esac
+
+          # Guard 2 — a pull request already exists for this head branch. That
+          # is the normal case on every push after the first, so it is a clean
+          # exit rather than a warning.
+          existing=$(gh pr list --repo "${REPO}" --head "${HEAD_REF}" \
+            --state open --json number --jq '.[0].number // ""')
+          if [ -n "${existing}" ]; then
+            echo "SKIP: pull request #${existing} is already open for"
+            echo "'${HEAD_REF}'. Nothing to open; this is the expected result"
+            echo "of a second push to the same branch."
+            exit 0
+          fi
+
+          # Guard 3 — the branch has commits ahead of main. Nothing to open
+          # otherwise, and `gh pr create` would fail on an empty diff anyway.
+          ahead=$(git rev-list --count origin/main..HEAD)
+          echo "commits ahead of main: ${ahead}"
+          if [ "${ahead}" -eq 0 ]; then
+            echo "SKIP: '${HEAD_REF}' has no commits ahead of main."
+            echo "There is nothing to open a pull request for."
+            exit 0
+          fi
+
+          # Guard 4 — PPA-1422. The branch carries no change main lacks, so
+          # there is nothing to open a pull request about whatever the commit
+          # graph says.
+          #
+          # Guard 3 is not enough on its own and cannot be made enough. It
+          # counts commits by ancestry, and a squash merge puts the branch's
+          # content on main under a new SHA without making the branch's own
+          # commits ancestors of it, so a branch that survives its own merge
+          # still reads as "ahead". Guard 3 stays rather than being collapsed
+          # into this one: they answer different questions and a reader
+          # diagnosing a skipped open is better served by two messages.
+          #
+          # The two-dot form is required. `git diff origin/main...HEAD` diffs
+          # from the merge base, which predates work already squashed onto main,
+          # and returned 13,218 bytes on the branch that proved the defect in
+          # peech-skills where `git diff origin/main HEAD` was empty.
+          if git diff --quiet origin/main HEAD; then
+            echo "SKIP: '${HEAD_REF}' carries no change main does not already"
+            echo "have, so there is nothing to open a pull request about."
+            echo "This is the normal state of a branch that survived its own"
+            echo "squash-merge — see PPA-1422 and the note above."
+            exit 0
+          fi
+          echo "branch carries changes main lacks: opening"
+
+          # Title and body from the branch's own commits. The body lists every
+          # PPA key the branch names, deduplicated in first-seen order.
+          #
+          # PPA-1285 — the title is derived from the branch's own ticket key,
+          # not from the first commit in the range. The oldest commit ahead of
+          # main is only the ticket's own work when the branch was cut from
+          # main; a branch cut from another ticket's branch opens its range
+          # with that ticket's already-merged commit, and the pull request and
+          # its squash were once titled for the wrong key that way.
+          #
+          # Deriving from the branch name closes that: the branch is named for
+          # exactly one ticket, and a mis-cut branch cannot change its own
+          # name. Among the branch's commits, the newest one naming that key
+          # supplies the subject, so the title still reads as the session
+          # wrote it rather than being synthesised. Newest rather than oldest
+          # because a stale predecessor sits at the START of the range.
+          #
+          # Two fallbacks, both logged. No key in the branch name: use the
+          # newest commit's subject, since there is no key to select on. Key
+          # present but named in no commit message: use the newest commit's
+          # subject and append the key, so the squash carries it even when the
+          # commit did not.
+          key=$(printf '%s' "${HEAD_REF}" | grep -oiE 'ppa-[0-9]+' | head -1 \
+            | tr '[:lower:]' '[:upper:]' || true)
+          newest=$(git log -1 --pretty=%s HEAD)
+
+          if [ -z "${key}" ]; then
+            echo "note: branch '${HEAD_REF}' carries no PPA key in its name."
+            title="${newest}"
+          else
+            echo "branch key: ${key}"
+            title=$(git log --pretty=%s origin/main..HEAD \
+              | grep -F "${key}" | head -1 || true)
+            if [ -z "${title}" ]; then
+              echo "note: no commit on this branch names ${key}; appending it."
+              title="${newest} (${key})"
+            fi
+          fi
+          echo "title: ${title}"
+
+          keys=$(git log --pretty=%B origin/main..HEAD \
+            | grep -oE 'PPA-[0-9]+' | awk '!seen[$0]++' || true)
+          if [ -z "${keys}" ]; then
+            echo "note: no PPA key found in the branch's commit messages."
+            echo "Opening anyway; the body names the branch instead."
+            printf 'Opened from %s by .github/workflows/pr-open.yml.\n' \
+              "${HEAD_REF}" > pr-body.txt
+          else
+            echo "keys: $(echo "${keys}" | tr '\n' ' ')"
+            {
+              echo "${keys}"
+              echo
+              printf 'Opened from %s by .github/workflows/pr-open.yml.\n' \
+                "${HEAD_REF}"
+            } > pr-body.txt
+          fi
+
+          # No `|| true` on the create. If the open fails the job fails,
+          # loudly: a workflow that swallows this and reports success leaves a
+          # branch with no pull request and nothing in the log saying so. The
+          # most likely failure is the repository's "Allow GitHub Actions to
+          # create and approve pull requests" setting being off, which reads as
+          # a permissions error naming GitHub Actions.
+          gh pr create --repo "${REPO}" --base main --head "${HEAD_REF}" \
+            --title "${title}" --body-file pr-body.txt
+
+          opened=$(gh pr list --repo "${REPO}" --head "${HEAD_REF}" \
+            --state open --json number --jq '.[0].number // ""')
+          echo "OPENED: pull request #${opened} for '${HEAD_REF}'."
+          echo "Arming is auto-merge-arm.yml's job, not this one."

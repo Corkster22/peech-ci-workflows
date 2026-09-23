@@ -1,0 +1,167 @@
+name: Auto-Merge — Arm
+
+# PPA-1590. peech-pmo-automation's auto-merge-arm.yml at origin/main fadfc00,
+# served as a callable workflow. The header history lives in that copy — why
+# arming left the session (PPA-1272), why it runs on a PAT (PPA-1278), why it is
+# a quiet-window sweep (PPA-1391) and why the sweep is the fallback behind the
+# SessionEnd hook (PPA-1407). The step and its rules are unchanged.
+#
+# A called workflow cannot carry a schedule, so the caller keeps its own
+# `schedule: */30` and `workflow_dispatch` triggers and passes its own
+# PEECH_AUTOMATION_TOKEN. No secret is stored here.
+#
+# This arms; it never merges. `--auto --squash` only, so the required checks
+# decide exactly as they do today.
+
+permissions:
+  contents: write
+  pull-requests: write
+
+on:
+  workflow_call:
+    secrets:
+      PEECH_AUTOMATION_TOKEN:
+        required: true
+
+jobs:
+  arm:
+    name: Arm every open ticket pull request whose branch has gone quiet
+    runs-on: ubuntu-latest
+
+    # One sweep at a time. Two overlapping sweeps would both read "not armed" for
+    # the same pull request; arming twice is harmless, but a queued run is
+    # cheaper than a raced one.
+    #
+    # Job-level rather than workflow-level, and the group is scoped to the
+    # caller repository. The caller must not declare this same group itself: a
+    # caller and a called workflow holding one group wait on each other.
+    concurrency:
+      group: auto-merge-arm-sweep
+      cancel-in-progress: false
+
+    steps:
+      # Every guard is a shell condition inside one step, not a job-level `if:`
+      # and not a matrix. A job skipped by `if:` writes no log at all, and each
+      # skip here has to state its reason — an unarmed pull request with no
+      # explanation is precisely the case a reader would otherwise have to
+      # diagnose.
+      #
+      # Nothing a branch name contains is interpolated into the shell: every
+      # value arrives through `env:` or through a `gh` response this step reads
+      # itself.
+      #
+      # No checkout step. Nothing here reads the repository.
+      - name: Arm every quiet ticket pull request, or log why not
+        env:
+          GH_TOKEN: ${{ secrets.PEECH_AUTOMATION_TOKEN }}
+          REPO: ${{ github.repository }}
+          # How long a branch must go without a push before its pull request is
+          # armed. peech-pmo-automation's header explains why it is twenty and
+          # what raising or lowering it trades away.
+          QUIET_MINUTES: 20
+        run: |
+          set -euo pipefail
+
+          # PPA-1278 — fail loudly on a missing secret. There is deliberately no
+          # fallback to GITHUB_TOKEN: a fallback would restore the suppressed
+          # attribution, the merge would raise no event, merge-close-out.yml
+          # would not run, and the ticket would strand with nothing in any log
+          # saying why. That invisibility is the defect, so an absent secret
+          # stops the job instead.
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::PEECH_AUTOMATION_TOKEN is empty or absent on this repository."
+            echo "This workflow does not fall back to GITHUB_TOKEN — see the header"
+            echo "comment and PPA-1278. Add the secret, then re-run this job."
+            exit 1
+          fi
+
+          quiet_seconds=$(( QUIET_MINUTES * 60 ))
+          now=$(date -u +%s)
+          echo "sweep at $(date -u -d "@${now}" +%Y-%m-%dT%H:%M:%SZ), quiet window ${QUIET_MINUTES}m"
+
+          # Only pull requests targeting main are candidates; the base filter is
+          # applied by the query rather than by a guard, so a stacked pull
+          # request never appears here at all.
+          candidates=$(gh pr list --repo "${REPO}" --state open --base main \
+            --limit 100 \
+            --json number,headRefName,headRefOid,isDraft,autoMergeRequest)
+
+          total=$(printf '%s' "${candidates}" | jq 'length')
+          echo "open pull requests against main: ${total}"
+          if [ "${total}" -eq 0 ]; then
+            echo "Nothing to sweep."
+            exit 0
+          fi
+
+          printf '%s' "${candidates}" | jq -c '.[]' | while read -r pr; do
+            number=$(printf '%s' "${pr}" | jq -r '.number')
+            head=$(printf '%s' "${pr}" | jq -r '.headRefName')
+            oid=$(printf '%s' "${pr}" | jq -r '.headRefOid')
+            draft=$(printf '%s' "${pr}" | jq -r '.isDraft')
+            already=$(printf '%s' "${pr}" | jq -r '.autoMergeRequest != null')
+
+            echo "--- pull request #${number}: ${head}"
+
+            # Guard 1 — the head branch is a ticket branch. A pull request
+            # opened by hand from another branch is not armed here; merge it
+            # yourself when it is ready.
+            case "${head}" in
+              ppa-*) ;;
+              *) echo "    SKIP: '${head}' does not match ppa-*."; continue ;;
+            esac
+
+            # Guard 2 — not a draft. Mark it ready for review and the next
+            # sweep will pick it up.
+            if [ "${draft}" = "true" ]; then
+              echo "    SKIP: draft."
+              continue
+            fi
+
+            # Guard 3 — idempotence. Arming an already-armed pull request is
+            # harmless, but re-reporting it every half hour is noise.
+            if [ "${already}" = "true" ]; then
+              echo "    SKIP: already armed."
+              continue
+            fi
+
+            # Guard 4 — the branch has gone quiet. Two clocks, because neither
+            # alone is the push: a commit authored an hour ago can be pushed
+            # this minute, and a branch can receive a run for something other
+            # than a push. The later of the two is what the wait is measured
+            # from, so both a fresh commit and a fresh push reset it.
+            committed=$(gh api "repos/${REPO}/commits/${oid}" \
+              --jq '.commit.committer.date' 2>/dev/null || true)
+            ran=$(gh run list --repo "${REPO}" --branch "${head}" --limit 1 \
+              --json createdAt --jq '.[0].createdAt // empty' 2>/dev/null || true)
+
+            latest=$(printf '%s\n%s\n' "${committed}" "${ran}" \
+              | grep -v '^$' | sort -r | head -1)
+            if [ -z "${latest}" ]; then
+              echo "    SKIP: neither a commit date nor a workflow run could be"
+              echo "    read for '${head}', so the quiet window cannot be"
+              echo "    measured. Not arming on an unknown."
+              continue
+            fi
+
+            last=$(date -u -d "${latest}" +%s)
+            age=$(( now - last ))
+            if [ "${age}" -lt "${quiet_seconds}" ]; then
+              echo "    WAIT: last activity ${latest}, $(( age / 60 ))m ago."
+              echo "    Arms once the branch has been quiet for ${QUIET_MINUTES}m."
+              continue
+            fi
+
+            echo "    last activity ${latest}, $(( age / 60 ))m ago — quiet."
+            # One pull request that refuses to arm must not stop the sweep
+            # reaching the rest of them. The failure is logged as a warning and
+            # the next sweep tries again in half an hour.
+            if gh pr merge "${number}" --repo "${REPO}" --auto --squash; then
+              echo "    ARMED: the required checks decide the merge; this"
+              echo "    workflow does not merge anything."
+            else
+              echo "::warning::could not arm pull request #${number}; the next"
+              echo "sweep will try again."
+            fi
+          done
+
+          echo "--- sweep complete."
