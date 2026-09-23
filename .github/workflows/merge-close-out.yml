@@ -22,14 +22,22 @@ permissions:
 
 on:
   workflow_call:
+    inputs:
+      # The channel id a held notice posts to (PPA-1601). Optional: with no
+      # channel, or no SLACK_BOT_TOKEN, the notice is a reported skip and the
+      # routing is unchanged.
+      slack_channel:
+        type: string
+        required: false
+        default: ""
     secrets:
       JIRA_EMAIL:
         required: true
       JIRA_API_TOKEN:
         required: true
-      # The held-at-In-Progress notice posts through peech_shared.slack, which
-      # this repository does not carry. Without it the notice degrades to a
-      # reported skip and the routing is unchanged, so the token is optional.
+      # The held-at-In-Progress notice posts with this token through Slack's
+      # chat.postMessage. Without it the notice is a reported skip and the
+      # routing is unchanged, so the token is optional.
       SLACK_BOT_TOKEN:
         required: false
 
@@ -87,13 +95,12 @@ jobs:
       # be expanded or executed here. Run from the caller's root, so git reads
       # the caller's merge.
       - name: Close out every PPA key the merge carried, and report any it does not
-        # Whether vars resolves to the caller's variables or this repository's
-        # was not confirmed against GitHub's documentation. Nothing breaks
-        # either way: notify_held() skips an unset channel, and a set one
-        # reaches post_notice(), whose import of peech_shared.slack fails on
-        # this runner and is reported as "notice not sent". The routing is
-        # unchanged whatever the channel holds.
+        # The channel comes from the caller's slack_channel input rather than
+        # vars, so which repository's variables a called workflow reads does
+        # not matter. notify_held() skips an unset channel or token, and a
+        # failed post is reported as "notice not sent"; the routing is
+        # unchanged either way.
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL_DELIVERY_OPS: ${{ vars.SLACK_CHANNEL_DELIVERY_OPS }}
+          SLACK_CHANNEL_DELIVERY_OPS: ${{ inputs.slack_channel }}
         run: python .peech-ci-workflows/scripts/pr_merge_close_out.py
