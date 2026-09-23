@@ -1,0 +1,175 @@
+name: Behind Branch — Update
+
+# PPA-1590. peech-pmo-automation's behind-branch-update.yml at origin/main
+# fadfc00, served as a callable workflow. The header history lives in that copy
+# — why strict mode stalls a queue (PPA-1285), why it runs on a PAT, why it
+# updates only the oldest, and why `auto_merge_enabled` joins `push` to main
+# (PPA-1412). The step and its rules are unchanged.
+#
+# The caller keeps its own triggers — `push` to main and `pull_request` of type
+# `auto_merge_enabled` — and passes its own PEECH_AUTOMATION_TOKEN. No secret is
+# stored here. The github context of a called workflow is the caller's, so
+# GITHUB_EVENT_NAME and github.repository below name the caller's event and
+# repository.
+#
+# What stops an update triggering another update is the caller's trigger set,
+# not anything here: an update raises `synchronize`, `check_run` and
+# `check_suite`, and none of them may be added to the caller's triggers.
+
+permissions:
+  contents: write
+  pull-requests: write
+
+on:
+  workflow_call:
+    secrets:
+      PEECH_AUTOMATION_TOKEN:
+        required: true
+
+jobs:
+  update:
+    name: Update the oldest armed pull request left behind by this merge
+    runs-on: ubuntu-latest
+
+    steps:
+      # No checkout. Every read is an API call, as in auto-merge-arm.yml —
+      # nothing here reads the repository's contents.
+      #
+      # The guards are shell conditions rather than a job-level `if:`. A job
+      # skipped by `if:` writes no log at all, and each skip here has to state
+      # its reason: a pull request sitting at BEHIND with nothing explaining
+      # why is exactly the case a reader would otherwise have to diagnose.
+      #
+      # Every value arrives through `env:`, so nothing a branch name contains
+      # can be expanded or executed.
+      - name: Update one behind branch, or log why not
+        env:
+          GH_TOKEN: ${{ secrets.PEECH_AUTOMATION_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # PPA-1278's guard, same reasoning: no fallback to GITHUB_TOKEN. A
+          # fallback would push the update under the suppressed token, the
+          # required checks would not re-run, and the branch would stay
+          # unmergeable with stale green checks and nothing in the log.
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::PEECH_AUTOMATION_TOKEN is empty or absent on this repository."
+            echo "This workflow does not fall back to GITHUB_TOKEN — see the header"
+            echo "comment and PPA-1285. Add the secret, then re-run this job."
+            exit 1
+          fi
+
+          # PPA-1412. Not `github.sha`. That is main's tip on a push event and
+          # the merge-ref SHA on a pull_request event, and the compare call
+          # below needs main either way. One API call buys a step that behaves
+          # identically under both triggers.
+          MAIN_SHA=$(gh api "repos/${REPO}/commits/main" --jq '.sha')
+          echo "triggered by ${GITHUB_EVENT_NAME:-unknown}; main is at ${MAIN_SHA}"
+
+          # Guards 1, 2 and 4 in one pass over the open pull requests, oldest
+          # first. Guard 1 — armed: an unarmed pull request is somebody's work
+          # in progress, and updating it is an unrequested rebase of their
+          # branch. Guard 2 — base main and head ppa-*, the same two the
+          # arming workflow applies. Guard 4 — not a draft.
+          candidates=$(gh pr list --repo "${REPO}" --state open --base main \
+            --json number,headRefName,isDraft,createdAt,autoMergeRequest \
+            --jq 'sort_by(.createdAt)
+                  | map(select(.autoMergeRequest != null))
+                  | map(select(.headRefName | test("^ppa-")))
+                  | map(select(.isDraft == false))
+                  | .[].number')
+
+          if [ -z "${candidates}" ]; then
+            echo "SKIP: no open pull request is armed, on a ppa-* head, and ready."
+            echo "Nothing to update; an unarmed or draft pull request is left alone."
+            exit 0
+          fi
+
+          echo "armed candidates, oldest first: $(echo "${candidates}" | tr '\n' ' ')"
+
+          # Guard 3 — mergeStateStatus is BEHIND, the only state an update
+          # fixes. BLOCKED means a check is failing or still running and an
+          # update would restart the whole set for nothing. DIRTY is a real
+          # conflict that needs a human. CLEAN needs no help.
+          #
+          # Why this re-reads — PPA-1391. GitHub computes mergeability lazily.
+          # Asking for mergeStateStatus on a pull request whose base has just
+          # moved starts a background computation and returns UNKNOWN until it
+          # finishes, and a run on `push: main` asks about four seconds after
+          # the merge that invalidated every open pull request. Reading once
+          # and treating UNKNOWN as "not BEHIND" updated no branch in five
+          # measured runs, so this keeps asking until the answer exists.
+          #
+          # The budget is a minute per candidate, far longer than the
+          # computation needs and cheap against a job billed at a one-minute
+          # minimum. Worst case is that budget times the candidate count, and
+          # only when every one of them is UNKNOWN.
+          #
+          # Guard 5 — the per-run cap is one, and it is what makes the queue
+          # drain serially rather than all at once. The SHA check below is the
+          # idempotence half: a branch that already contains this commit is not
+          # behind it, whatever a stale mergeStateStatus says.
+          for pr in ${candidates}; do
+            head=$(gh pr view "${pr}" --repo "${REPO}" \
+              --json headRefName --jq '.headRefName')
+
+            state=UNKNOWN
+            attempt=0
+            while [ "${attempt}" -lt 12 ]; do
+              state=$(gh pr view "${pr}" --repo "${REPO}" \
+                --json mergeStateStatus --jq '.mergeStateStatus')
+              [ "${state}" != "UNKNOWN" ] && break
+              attempt=$(( attempt + 1 ))
+              echo "    #${pr} (${head}): mergeStateStatus is UNKNOWN, attempt"
+              echo "    ${attempt} of 12. GitHub is still recomputing it."
+              sleep 5
+            done
+
+            if [ "${state}" = "UNKNOWN" ]; then
+              # It never settled. Fall through to the commit comparison below,
+              # which is computed on request and does not depend on the lazy
+              # value at all. Skipping here would reinstate the defect this
+              # change closes, and a branch in real conflict is caught by the
+              # update failing rather than by this guard.
+              echo "    #${pr} (${head}): mergeStateStatus never settled inside"
+              echo "    the budget. Falling through to the commit comparison,"
+              echo "    which is synchronous."
+            elif [ "${state}" != "BEHIND" ]; then
+              echo "SKIP: pull request #${pr} (${head}) is ${state}, not BEHIND."
+              continue
+            fi
+
+            behind_by=$(gh api \
+              "repos/${REPO}/compare/${MAIN_SHA}...${head}" \
+              --jq '.behind_by')
+            if [ "${behind_by}" -eq 0 ]; then
+              echo "SKIP: pull request #${pr} (${head}) already contains ${MAIN_SHA}."
+              echo "Its BEHIND status is stale; nothing to push."
+              continue
+            fi
+
+            echo "UPDATING: pull request #${pr} (${head}), ${behind_by} commit(s)"
+            echo "behind ${MAIN_SHA}. It is the oldest armed pull request left"
+            echo "behind by this merge."
+            # A branch that cannot be updated is almost always in real conflict
+            # with main, which needs a human. Under `set -e` an unguarded call
+            # would fail the job, and this workflow would then turn red on every
+            # merge for as long as that one branch stayed open. Warn, and carry
+            # on to the next candidate, so one stuck branch cannot jam the queue
+            # behind it.
+            if gh pr update-branch "${pr}" --repo "${REPO}"; then
+              echo "UPDATED: pull request #${pr}. The required checks re-run on the"
+              echo "new head and decide the merge; this workflow merges nothing."
+              echo "Stopping here by design — the next merge to main starts this"
+              echo "workflow again and the queue drains one pull request at a time."
+              exit 0
+            fi
+            echo "::warning::could not update pull request #${pr} (${head}); it is"
+            echo "most likely in real conflict with main and needs a human. Trying"
+            echo "the next candidate so one stuck branch does not jam the queue."
+          done
+
+          echo "SKIP: no armed pull request is BEHIND ${MAIN_SHA}."
+          echo "Every candidate was already current, blocked on a check, or in"
+          echo "conflict. Nothing to update."
