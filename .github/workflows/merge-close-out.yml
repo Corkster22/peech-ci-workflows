@@ -119,7 +119,9 @@ jobs:
         # not matter. notify_held() skips an unset channel or token, and a
         # failed post is reported as "notice not sent"; the routing is
         # unchanged either way. On this repository's own push no input is
-        # passed, so the channel is empty and the notice is a reported skip.
+        # passed, so the channel falls back to this repository's
+        # SLACK_CHANNEL_DELIVERY_OPS secret (PPA-1617); a caller's input
+        # still wins.
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_DELIVERY_OPS: ${{ inputs.slack_channel || secrets.SLACK_CHANNEL_DELIVERY_OPS }}
