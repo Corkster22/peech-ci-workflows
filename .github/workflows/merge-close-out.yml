@@ -18,11 +18,21 @@ name: Merge Close-Out — Record
 # PPA-1614. The re-grade runs when a caller passes `regrade: true` from its
 # schedule trigger, as `regrade: ${{ github.event_name == 'schedule' }}`. Each
 # job takes exactly one value of that input, so one caller file serves both.
+#
+# PPA-1616. This repository closes out its own merges by running this file
+# directly on push to main, under its own JIRA_EMAIL and JIRA_API_TOKEN
+# repository secrets. The two checkouts then both land on this repository, as
+# they would for a caller. `inputs` is empty on a push, so the close-out job
+# runs and the re-grade job is skipped; no re-grade is scheduled here, because
+# peech-pmo-automation's hourly sweep already covers every held PPA ticket.
 
 permissions:
   contents: read
 
 on:
+  push:
+    branches:
+      - main
   workflow_call:
     inputs:
       # The channel id a held notice posts to (PPA-1601). Optional: with no
@@ -108,7 +118,8 @@ jobs:
         # vars, so which repository's variables a called workflow reads does
         # not matter. notify_held() skips an unset channel or token, and a
         # failed post is reported as "notice not sent"; the routing is
-        # unchanged either way.
+        # unchanged either way. On this repository's own push no input is
+        # passed, so the channel is empty and the notice is a reported skip.
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_DELIVERY_OPS: ${{ inputs.slack_channel }}

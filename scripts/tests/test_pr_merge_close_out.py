@@ -470,10 +470,12 @@ def test_the_workflow_exists_at_the_repo_root_and_is_callable():
     """GitHub reads workflows from the repo-root .github/workflows only.
 
     PPA-1577. In peech-pmo-automation this test asserts the push trigger and
-    the re-grade sweep. Here the workflow is called, not triggered: the caller
-    runs it on push to main and passes its Jira pair as secrets. PPA-1614 added
-    the sweep as a second job, run when the caller passes regrade true; see
-    test_merge_close_out_regrade.py.
+    the re-grade sweep. Here the workflow is called: the caller runs it on push
+    to main and passes its Jira pair as secrets. PPA-1614 added the sweep as a
+    second job, run when the caller passes regrade true; see
+    test_merge_close_out_regrade.py. PPA-1616 added push to main so this
+    repository closes out its own merges; see
+    test_merge_close_out_self_trigger.py.
     """
     import yaml
 
@@ -481,7 +483,7 @@ def test_the_workflow_exists_at_the_repo_root_and_is_callable():
     # PyYAML reads the bare key `on` as the boolean True.
     secrets = workflow[True]["workflow_call"]["secrets"]
 
-    assert list(workflow[True]) == ["workflow_call"]
+    assert list(workflow[True]) == ["push", "workflow_call"]
     assert secrets["JIRA_EMAIL"] == {"required": True}
     assert secrets["JIRA_API_TOKEN"] == {"required": True}
     assert secrets["SLACK_BOT_TOKEN"] == {"required": False}
