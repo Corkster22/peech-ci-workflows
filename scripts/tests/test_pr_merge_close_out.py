@@ -2020,16 +2020,13 @@ def test_the_two_extractors_reach_the_same_rows():
             == {1: "MET", 2: "MET", 3: "MET"})
 
 
-@pytest.mark.skipif(
-    not (Path(__file__).resolve().parents[2] / "CLAUDE.md").is_file(),
-    reason="PPA-1577: peech-ci-workflows carries no CLAUDE.md; the statement lives in peech-pmo-automation's")
-def test_claude_md_carries_the_close_out_shape_statement():
+def test_delegation_md_carries_the_close_out_shape_statement():
     """The other half of PPA-1517: the parser is widened and the shape a
     close-out must take is written where a session reads it before writing one.
+    PPA-1609 moved the delegation rules out of CLAUDE.md into delegation.md,
+    which every repository's CLAUDE.md imports.
     """
-    claude_md = (Path(__file__).resolve().parents[2] / "CLAUDE.md").read_text()
-    block = claude_md.split("<!-- pt-delegation:start")[1].split(
-        "<!-- pt-delegation:end -->")[0]
+    block = (Path(__file__).resolve().parents[2] / "delegation.md").read_text()
 
     for sentence in (
         "Write one row per Definition of Done condition, in the field's own "

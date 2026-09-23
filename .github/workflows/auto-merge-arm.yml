@@ -12,6 +12,13 @@ name: Auto-Merge — Arm
 #
 # This arms; it never merges. `--auto --squash` only, so the required checks
 # decide exactly as they do today.
+#
+# PPA-1607. The conflicting-base alarm is ported from peech-skills'
+# auto-merge-arm.yml at origin/main 1dcd48e, the PPA-1435 change (352848b,
+# 16-SEP-2026): an armed pull request whose base is CONFLICTING fails the sweep,
+# naming the pull request, because auto-merge waits on a conflict forever
+# rather than failing it. The arm job PPA-1435 added to peech-skills'
+# pr-open.yml is not ported; the sweep is the standard here.
 
 permissions:
   contents: write
@@ -75,6 +82,9 @@ jobs:
             exit 1
           fi
 
+          printf '| pull request | branch | state |\n|---|---|---|\n' \
+            >> "${GITHUB_STEP_SUMMARY}"
+
           quiet_seconds=$(( QUIET_MINUTES * 60 ))
           now=$(date -u +%s)
           echo "sweep at $(date -u -d "@${now}" +%Y-%m-%dT%H:%M:%SZ), quiet window ${QUIET_MINUTES}m"
@@ -84,7 +94,7 @@ jobs:
           # request never appears here at all.
           candidates=$(gh pr list --repo "${REPO}" --state open --base main \
             --limit 100 \
-            --json number,headRefName,headRefOid,isDraft,autoMergeRequest)
+            --json number,headRefName,headRefOid,isDraft,autoMergeRequest,mergeable)
 
           total=$(printf '%s' "${candidates}" | jq 'length')
           echo "open pull requests against main: ${total}"
@@ -99,6 +109,7 @@ jobs:
             oid=$(printf '%s' "${pr}" | jq -r '.headRefOid')
             draft=$(printf '%s' "${pr}" | jq -r '.isDraft')
             already=$(printf '%s' "${pr}" | jq -r '.autoMergeRequest != null')
+            mergeable=$(printf '%s' "${pr}" | jq -r '.mergeable')
 
             echo "--- pull request #${number}: ${head}"
 
@@ -117,10 +128,37 @@ jobs:
               continue
             fi
 
-            # Guard 3 — idempotence. Arming an already-armed pull request is
-            # harmless, but re-reporting it every half hour is noise.
+            # Guard 3 — idempotence, and the one case where an already-armed
+            # pull request still needs saying out loud. The rule, as
+            # peech-skills' copy states it at 1dcd48e (PPA-1435):
+            #
+            #   "Auto-merge waits on a conflicting base rather than failing, so
+            #   an armed pull request whose base has moved under it sits green
+            #   and never merges, and nothing reports that today."
+            #
+            #   "Detection is the pull request's own mergeable state read from
+            #   the API, never an inference from how long the thing has been
+            #   open."
+            #
+            # A pull request becomes conflicting when main moves, after it was
+            # armed, so only something that re-reads an already-armed pull
+            # request can see it, and this sweep is the only thing that does.
+            #
+            # PPA-1607, considered and dropped: GitHub computes `mergeable`
+            # lazily, so a list read can return UNKNOWN for a pull request whose
+            # base has just moved. That pull request is not flagged this sweep;
+            # the read starts the computation and the next sweep sees
+            # CONFLICTING. The cost is one cadence of delay, not a missed alarm.
             if [ "${already}" = "true" ]; then
-              echo "    SKIP: already armed."
+              if [ "${mergeable}" = "CONFLICTING" ]; then
+                echo "    ARMED BUT BLOCKED: base conflicts, so auto-merge waits forever."
+                echo "::error::pull request #${number} (${head}) is armed but cannot merge: its base conflicts with main. Auto-merge waits on a conflicting base rather than failing, so it will never merge. Rebase or merge main into '${head}'."
+                printf '| #%s | `%s` | armed, base CONFLICTING — will never merge |\n' \
+                  "${number}" "${head}" >> "${GITHUB_STEP_SUMMARY}"
+                touch "${RUNNER_TEMP}/blocked"
+                continue
+              fi
+              echo "    SKIP: already armed (mergeable=${mergeable})."
               continue
             fi
 
@@ -165,3 +203,14 @@ jobs:
           done
 
           echo "--- sweep complete."
+
+          # A record a person or a query can find without opening GitHub. The
+          # annotation above turns the run red, so `gh run list --workflow
+          # auto-merge-arm.yml --status failure` returns exactly the sweeps
+          # that saw a blocked pull request, and the job summary names which.
+          # Arming itself already succeeded for everything armable this run —
+          # this exit reports the blockage, it does not undo any of that.
+          if [ -f "${RUNNER_TEMP}/blocked" ]; then
+            echo "One or more armed pull requests cannot merge; see the annotations above."
+            exit 1
+          fi
