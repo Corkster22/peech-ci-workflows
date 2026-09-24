@@ -14,7 +14,9 @@ somewhere else (PPA-965 and PPA-1013 were both still at To Do). Here the
 starting status is read, never assumed.
 
 Idempotent by design: a key already at or past the target is reported NOOP and
-no write is attempted. Running twice is safe, and a session that already
+no write is attempted. The one exception is a caller passing --allow-backward,
+for whom a target behind the current rung is a move to make, not a NOOP
+(PPA-1651). Running twice is safe, and a session that already
 applied its own transition costs nothing — whichever runs second no-ops.
 
 Conductor-gated by destination. PPA-1025: a hop whose destination is in
@@ -82,15 +84,18 @@ the inattention path that let the ownership rule fail four times — PPA-896,
 PPA-965, PPA-1013 and PPA-1022. It does not stop a session that decides to
 pass the flag.
 
-Distributed, not shared. PPA-1126 copied this file into peech-skills and
-peech-org-skills so the UserPromptSubmit transition hook is not dead in two of
-the three governed repos. The copies are byte-identical; edit this one and copy
-it out again. Credentials stay in one place — see CREDENTIALS below.
+One home. Under PPA-1581 this file lives in peech-ci-workflows and nowhere
+else; edit it here. CI reads it from the .peech-ci-workflows checkout each
+calling workflow makes, at .peech-ci-workflows/scripts/pt_transition.py. The
+UserPromptSubmit plugin hook reads it from the local clone, at
+~/Documents/Claude-Projects/peech-ci-workflows/scripts/pt_transition.py.
+Credentials stay in one place — see CREDENTIALS below.
 
 Usage:
     python3 scripts/pt_transition.py --keys PPA-1,PPA-2 --to "Done"
     python3 scripts/pt_transition.py --keys PPA-1 --to "Done" --dry-run
     python3 scripts/pt_transition.py --keys PPA-1 --to "Reopened" --conductor
+    python3 scripts/pt_transition.py --keys PPA-1 --to "To Do" --allow-backward
 """
 
 import argparse
@@ -138,6 +143,11 @@ MERGE_CLOSE_OUT_WORKFLOW = ".github/workflows/merge-close-out.yml"
 # Dropped, 24-SEP-2026: peech-pmo-automation's merge-close-out.yml header still
 # says GITHUB_EVENT_NAME must be push. It is a comment no code reads, so nothing
 # misbehaves while it is wrong; this tuple is the rule.
+#
+# Dropped, 24-SEP-2026 (PPA-1663): peech-pmo-automation's own copy of this file
+# still compares GITHUB_EVENT_NAME to "push" alone. Its close-out calls this
+# repository's workflow, which runs this copy, so that copy runs only locally,
+# where merge_close_out_run() is False whatever the tuple holds.
 CLOSE_OUT_EVENTS = ("push", "schedule")
 
 # Status *names* whose arrival is a gate verdict rather than a work event, so
@@ -155,12 +165,11 @@ CONDUCTOR_ONLY = ("Reopened",)
 
 # ---------------------------------------------------------------- credentials
 
-#: The single credential home for every copy of this script. Settled 21-AUG-2026
-#: under PPA-1126, when the script was distributed into peech-skills and
-#: peech-org-skills: the path stays absolute and stays here rather than becoming
-#: resolvable per repo. One .env is one place to rotate a token; three would be
-#: three, and two of the three repos have no secrets/ directory and no
-#: gitignore entry for one. The copies are byte-identical by design.
+#: The single credential home for this script, wherever it runs from. Settled
+#: 21-AUG-2026 under PPA-1126: the path stays absolute and stays here rather
+#: than becoming resolvable per repo. One .env is one place to rotate a token,
+#: and the repos that call this script have no secrets/ directory and no
+#: gitignore entry for one. CI writes the caller's pair to this same path.
 CREDENTIALS = ROOT / "peech-pmo-automation/secrets/.env"
 
 
@@ -169,7 +178,7 @@ def load_credentials():
     if not env.is_file():
         raise FileNotFoundError(
             f"no Jira credentials at {env} — this is the single credential home for "
-            "every copy of this script (PPA-1126). Clone peech-pmo-automation "
+            "this script (PPA-1126). Clone peech-pmo-automation "
             "alongside this repo, or point CREDENTIALS at the .env you hold.")
     out = {}
     for line in env.read_text().splitlines():
@@ -368,7 +377,8 @@ def choose_transition(current, target, transitions, ladder=None):
         return None, (f"target status {target!r} is not on the lifecycle "
                       f"ladder and is not offered from {current!r}")
     if there <= here:
-        return None, f"target {target!r} is not forward of {current!r}"
+        return None, (f"target {target!r} is not forward of {current!r} and "
+                      f"no offered transition reaches it by name")
 
     forward = {}
     for t in transitions:
@@ -418,7 +428,7 @@ class Result:
 
 
 def advance(get, post, key, target, dry_run=False, ladder=None,
-            conductor=False, merge_close_out=False):
+            conductor=False, merge_close_out=False, allow_backward=False):
     """Walk one key toward `target`, re-reading status after every hop."""
     try:
         start = read_status(get, key)
@@ -437,9 +447,18 @@ def advance(get, post, key, target, dry_run=False, ladder=None,
     # nothing. It also refuses to route backward on its own initiative:
     # without this, a workflow offering a direct backward transition would see
     # it fired and the ticket walked down a rung.
+    #
+    # PPA-1651. A caller who names a backward end state on purpose declares it
+    # with --allow-backward; the hook never passes it, so its case is the NOOP
+    # above. Intent is declared, never sniffed from the environment - ruled on
+    # PPA-1651, comment 30112. With the flag the loop below runs, and
+    # choose_transition() fires the one offered transition reaching the target
+    # by name, or halts where zero or several do. A NOOP there would report
+    # success on a ticket that never moved, which is how PPA-1390 read as done.
     rungs = LADDER if ladder is None else ladder
     here, there = rungs.get(norm(current)), rungs.get(norm(target))
-    if here is not None and there is not None and here > there:
+    if (not allow_backward and here is not None and there is not None
+            and here > there):
         return Result(key, start, current, 0, "NOOP",
                       f"already past {target!r}; no write attempted")
 
@@ -532,9 +551,9 @@ def advance(get, post, key, target, dry_run=False, ladder=None,
 
 
 def run(get, post, keys, target, dry_run=False, ladder=None,
-        conductor=False, merge_close_out=False):
+        conductor=False, merge_close_out=False, allow_backward=False):
     return [advance(get, post, key, target, dry_run, ladder, conductor,
-                    merge_close_out)
+                    merge_close_out, allow_backward)
             for key in keys]
 
 
@@ -586,6 +605,11 @@ def build_parser():
                              "Without it such a hop halts and writes nothing. "
                              "The claim is not verified — see the module "
                              "docstring")
+    parser.add_argument("--allow-backward", action="store_true",
+                        help="permit a target behind the current rung, fired "
+                             "only where exactly one offered transition "
+                             "reaches it by name; otherwise the key halts. "
+                             "Without it such a target is a NOOP (PPA-1651)")
     parser.add_argument("--skip-validation", action=RetiredFlag,
                         help="RETIRED by PPA-1264. Passing it is an error, not "
                              "a no-op — see the module docstring")
@@ -604,7 +628,8 @@ def main(argv=None):
     # takes the answer as an argument - see merge_close_out_run().
     results = run(get, post, keys, args.target, args.dry_run,
                   conductor=args.conductor,
-                  merge_close_out=merge_close_out_run(os.environ))
+                  merge_close_out=merge_close_out_run(os.environ),
+                  allow_backward=args.allow_backward)
     for result in results:
         print(result.line())
 
