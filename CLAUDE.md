@@ -52,24 +52,24 @@ configuration from `inputs` and `secrets`, not `vars`.
 ## Run Instructions
 
 Nothing here runs locally except the suite. `pytest.yml` runs on this
-repository's own pull requests and pushes to `main`, and `merge-close-out.yml`
-runs on push to `main` under this repository's own `JIRA_EMAIL` and
-`JIRA_API_TOKEN` secrets. Every other workflow runs only when a caller invokes
-it. No schedule runs, and no secret is stored in the repository's files.
+repository's own pull requests and pushes to `main`. Three callable workflows
+also run on this repository's own events, under its own secrets: `pr-open.yml`
+on push to a `ppa-*` branch, `auto-merge-arm.yml` on its half-hourly schedule
+and on `workflow_dispatch`, and `merge-close-out.yml` on push to `main`.
+`behind-branch-update.yml` runs only when a caller invokes it. No secret is
+stored in the repository's files.
 
-`merge-close-out.yml` records the merge hash and applies the close-out
-transition on this repository's own merges to `main`. No workflow opens or arms
-a pull request here, because this repository calls neither `pr-open.yml` nor
-`auto-merge-arm.yml`. That replaces the Delegation block's close-out bullet for
-this repository only:
+`pr-open.yml` opens and arms this repository's own `ppa-*` pull requests, and
+the `auto-merge-arm.yml` sweep arms any the push missed. The close-out runs as
+the Delegation block states it:
 
 - The session commits to `ppa-<key>`, posts its close-out checklist on each
   ticket, then pushes and stops.
-- The conductor opens the pull request and merges it once `pytest` passes.
-- The merge records its hash on each key and applies the close-out transition
-  through `merge-close-out.yml`, as it does in a calling repository.
-- No `UserPromptSubmit` hook runs here, so a dispatch does not move its keys to
-  In Progress.
+- `pytest` decides the merge. The merge records its hash on each key and
+  applies the close-out transition through `merge-close-out.yml`, as it does in
+  a calling repository.
+- No `UserPromptSubmit` hook runs here. `pr-open.yml` moves the branch's own
+  key to In Progress on the push; no other key in the command moves.
 - If the push is refused, the session stops and reports the staged files. The
   conductor pushes from the Run Terminal.
 

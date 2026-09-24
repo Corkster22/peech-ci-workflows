@@ -406,9 +406,12 @@ failure instead of by a rule.
 
 One ticket's rows in a multi-ticket close-out — PPA-1656
 --------------------------------------------------------
-**A line that is not a checklist row and names exactly one PPA key opens that
-key's section, and the section runs to the next such line. A ticket is graded
-against the rows in its own sections and the rows before the first one.**
+**A line opens a key's section only when, after leading whitespace and Markdown
+heading or emphasis marks (``#``, ``*``, ``_``) are stripped, it starts with
+that PPA key and is not a checklist row. The section runs to the next such
+line. A ticket is graded against the rows in its own sections and the rows
+before the first one.** PPA-1657 narrowed it to that, from any line naming
+exactly one key.
 
 Why it needed deciding. The PPA-1555 boundary above splits one text into
 checklists but says nothing about whose each one is, so every row in a comment
@@ -419,17 +422,14 @@ tickets at In Progress. ``section_rows`` supplies the owner: the heading above
 a row, which PPA-1619's amendment makes the required shape for a close-out
 covering more than one ticket.
 
+Worked: ``## PPA-1612``, ``**PPA-1612**`` and ``PPA-1612 - close-out`` each
+open PPA-1612's section. ``Blocked by PPA-1619, now merged.`` opens none, so a
+prose line naming another key, before the checklist or after it, leaves the
+rows where they were.
+
 Rows before the first key heading belong to every key. A comment with no key
 heading is therefore one section belonging to every key and reads exactly as it
-did before, and a single-ticket close-out that names another key only after its
-checklist - "this unblocks PPA-1619" - keeps its rows.
-
-What this rule costs, stated rather than discovered later: a prose line naming
-one other key *before* the checklist - "blocked by PPA-1619, now merged" - opens
-that key's section, so the rows under it are filed against PPA-1619 and the
-ticket being graded reads as having no checklist. It is held at In Progress
-with the held notice, which a person reads; it is not closed on another
-ticket's rows. A line naming two keys or more opens nothing.
+did before.
 
 A held ticket gets a second reader — PPA-1556
 ----------------------------------------------
@@ -1044,10 +1044,11 @@ def section_rows(lines, key):
     """The rows in one PPA key's section of a close-out, in written order.
 
     See "One ticket's rows in a multi-ticket close-out" in the module
-    docstring. A line that is not a checklist row and names exactly one PPA key
-    opens that key's section, which runs to the next such line. Rows before the
-    first such line belong to every key, so a comment with none reads exactly
-    as ``stated_rows`` reads it.
+    docstring. A line that is not a checklist row and starts with a PPA key,
+    once ``_HEADING_MARKS_RE`` is stripped from its front, opens that key's
+    section, which runs to the next such line. Rows before the first such line
+    belong to every key, so a comment with none reads exactly as
+    ``stated_rows`` reads it.
 
     Takes lines for the same reason ``stated_rows`` does: the merge passes
     ``adf_lines(body)`` and the Stop grader passes ``text.splitlines()``.
@@ -1056,14 +1057,26 @@ def section_rows(lines, key):
     kept = []
     owner = None
     for raw in lines:
-        if _row_in(raw) is None:
-            named = keys_in(raw)
-            if len(named) == 1:
-                owner = named[0]
-                continue
+        opened = _section_key(raw)
+        if opened:
+            owner = opened
+            continue
         if owner is None or owner == key:
             kept.append(raw)
     return stated_rows(kept)
+
+
+#: What may stand in front of the key on a line that opens its section:
+#: whitespace and Markdown heading or emphasis marks, in any mix - PPA-1657.
+_HEADING_MARKS_RE = re.compile(r"^[\s#*_]*")
+
+
+def _section_key(raw):
+    """The key whose section this line opens, uppercased, or None."""
+    if _row_in(raw) is not None:
+        return None
+    head = KEY_RE.match(_HEADING_MARKS_RE.sub("", raw, count=1))
+    return head and head.group(1).upper()
 
 
 #: A word that discriminates between two conditions not at all, dropped before

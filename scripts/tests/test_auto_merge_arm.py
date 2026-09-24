@@ -120,3 +120,12 @@ def test_a_blocked_pull_request_does_not_stop_the_sweep_arming_the_rest(tmp_path
 
     assert done.returncode == 1, done.stdout + done.stderr
     assert (tmp_path / "merged.log").read_text() == "44\n"
+
+
+def test_schedule_and_dispatch_are_triggers_beside_workflow_call():
+    """PPA-1658 — this repository sweeps its own pull requests half-hourly."""
+    # PyYAML reads the bare key `on` as the boolean True.
+    on = yaml.safe_load(WORKFLOW.read_text())[True]
+
+    assert list(on) == ["schedule", "workflow_dispatch", "workflow_call"]
+    assert on["schedule"] == [{"cron": "*/30 * * * *"}]
