@@ -196,6 +196,71 @@ def test_key_already_past_the_target_is_noop_and_fires_nothing(ppa_plan):
 
 
 # --------------------------------------------------------------------------
+# PPA-1651 — an explicitly named backward target, declared by --allow-backward
+# --------------------------------------------------------------------------
+
+def _with_revert(ppa_plan, *reverts):
+    """`ppa_plan` with In Progress offering the given backward transitions,
+    shaped like the live "Revert - Back to To Do" PPA-1390 was moved by."""
+    plan = {status: list(entries) for status, entries in ppa_plan.items()}
+    plan["In Progress"] += [transition(id_, "Revert - Back to To Do", "To Do")
+                            for id_ in reverts]
+    return plan
+
+
+def test_a_backward_target_with_one_offered_transition_is_reached(ppa_plan):
+    stub = StubJira("In Progress", _with_revert(ppa_plan, "41"))
+
+    results = run(stub.get, stub.post, ["PPA-1"], "To Do", allow_backward=True)
+
+    assert results[0].verdict == "PASS"
+    assert (results[0].end, results[0].hops) == ("To Do", 1)
+    assert [p["transition"]["id"] for _, p in stub.posts] == ["41"]
+    assert exit_code(results) == 0
+
+
+def test_a_backward_target_no_transition_reaches_halts(ppa_plan):
+    stub = StubJira("In Progress", ppa_plan)
+
+    results = run(stub.get, stub.post, ["PPA-1"], "To Do", allow_backward=True)
+
+    assert results[0].verdict == "HALT"
+    assert "no offered transition reaches it" in results[0].detail
+    assert stub.posts == []
+    assert exit_code(results) == 1
+
+
+def test_a_backward_target_two_transitions_reach_halts(ppa_plan):
+    stub = StubJira("In Progress", _with_revert(ppa_plan, "41", "42"))
+
+    results = run(stub.get, stub.post, ["PPA-1"], "To Do", allow_backward=True)
+
+    assert results[0].verdict == "HALT"
+    assert "ambiguous" in results[0].detail
+    assert stub.posts == []
+
+
+def test_without_the_flag_a_backward_target_stays_a_noop(ppa_plan):
+    """The hook never passes --allow-backward, so an offered backward
+    transition is still never fired on its behalf."""
+    stub = StubJira("Client Validation", ppa_plan)
+    stub.plan["Client Validation"].append(
+        transition("43", "Revert - Back to In Progress", "In Progress"))
+
+    results = run(stub.get, stub.post, ["PPA-1"], "In Progress")
+
+    assert [r.verdict for r in results] == ["NOOP"]
+    assert stub.posts == [] and stub.transition_reads == 0
+
+
+def test_the_flag_is_parsed_and_defaults_off():
+    assert build_parser().parse_args(
+        ["--keys", "PPA-1", "--to", "To Do"]).allow_backward is False
+    assert build_parser().parse_args(
+        ["--keys", "PPA-1", "--to", "To Do", "--allow-backward"]).allow_backward
+
+
+# --------------------------------------------------------------------------
 # PPA-1025 — the conductor-owned destination is gated behind --conductor
 # --------------------------------------------------------------------------
 #
@@ -564,12 +629,16 @@ def test_the_guard_folds_case_and_dash_variants_like_every_other_name():
 
 def test_no_override_flag_was_added():
     """Item 2. Restoring an override under any name would rebuild the thing
-    that has now failed twice, so the parser gains no new store_true."""
+    that has now failed twice, so the parser gains no new store_true.
+
+    --allow-backward (PPA-1651) is the one flag added since, and it is no
+    override of this guard: Done is the last rung, so no target behind the
+    current one is ever Done."""
     source = SOURCE.read_text()
     assert "skip_validation" not in source.replace("--skip-validation", "")
     flags = re.findall(r'add_argument\("(--[a-z-]+)"', source)
     assert flags == ["--keys", "--to", "--dry-run", "--conductor",
-                     "--skip-validation"]
+                     "--allow-backward", "--skip-validation"]
 
 
 def test_a_dry_run_surfaces_the_refusal_rather_than_a_plan(ppa_plan):
