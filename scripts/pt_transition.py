@@ -125,10 +125,20 @@ WORKING, VALIDATION, FINAL = LIFECYCLE[1], LIFECYCLE[-2], LIFECYCLE[-1]
 # The one caller PPA-1459 exempts from the PPA-1433 guard, identified by the
 # environment GitHub Actions gives its own runner rather than by a flag. The
 # path is the same in all three governed repositories, checked 17-SEP-2026, and
-# each copy is triggered on push to main and is not dispatchable - so the four
-# facts below are together a statement about where this process is running, not
-# a claim its caller makes.
+# the four facts below are together a statement about where this process is
+# running, not a claim its caller makes. PPA-1614 admits the schedule trigger
+# beside the push: the hourly re-grade grades held tickets the same way.
 MERGE_CLOSE_OUT_WORKFLOW = ".github/workflows/merge-close-out.yml"
+
+# The events a close-out run is raised by. A push to main is the merge itself;
+# the schedule is the hourly re-grade of tickets a merge left held (PPA-1614).
+# workflow_dispatch is absent on purpose: a dispatch is a person choosing to
+# run the workflow, which is a hand run by another route.
+#
+# Dropped, 24-SEP-2026: peech-pmo-automation's merge-close-out.yml header still
+# says GITHUB_EVENT_NAME must be push. It is a comment no code reads, so nothing
+# misbehaves while it is wrong; this tuple is the rule.
+CLOSE_OUT_EVENTS = ("push", "schedule")
 
 # Status *names* whose arrival is a gate verdict rather than a work event, so
 # only the conductor fires a hop landing on one. Names, never IDs — the same
@@ -254,8 +264,9 @@ def merge_close_out_run(environ):
 
     * GITHUB_ACTIONS - a runner rather than a laptop.
     * GITHUB_EVENT_NAME and GITHUB_REF - a push to the default branch, which is
-      the merge the close-out exists to record. A run detached from one has
-      nothing to close out.
+      the merge the close-out exists to record, or the scheduled re-grade,
+      which GitHub runs on the default branch (PPA-1614). A dispatch is
+      refused on any ref, because it is a person choosing to run it.
     * GITHUB_WORKFLOW_REF - this workflow and not another job in the same
       repository. Its documented form is
       ``owner/repo/.github/workflows/name.yml@refs/heads/branch``, so the ref
@@ -269,7 +280,7 @@ def merge_close_out_run(environ):
     """
     workflow = (environ.get("GITHUB_WORKFLOW_REF") or "").split("@", 1)[0]
     return (environ.get("GITHUB_ACTIONS") == "true"
-            and environ.get("GITHUB_EVENT_NAME") == "push"
+            and environ.get("GITHUB_EVENT_NAME") in CLOSE_OUT_EVENTS
             and environ.get("GITHUB_REF") == "refs/heads/main"
             and workflow.endswith("/" + MERGE_CLOSE_OUT_WORKFLOW))
 

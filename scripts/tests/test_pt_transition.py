@@ -676,6 +676,24 @@ def test_the_branch_suffix_is_split_off_before_the_path_is_matched():
             {**CLOSE_OUT_ENV, "GITHUB_WORKFLOW_REF": ref}) is True
 
 
+def test_the_regrade_runner_is_recognised():
+    """PPA-1614. The hourly re-grade is the same workflow on its schedule
+    trigger. GitHub runs a scheduled workflow on the default branch, so its
+    GITHUB_REF is refs/heads/main just as a push to main's is."""
+    assert pt_transition.merge_close_out_run(
+        {**CLOSE_OUT_ENV, "GITHUB_EVENT_NAME": "schedule"}) is True
+
+
+def test_a_dispatch_run_is_refused():
+    """The caller's file is dispatchable, and a dispatch is a person choosing
+    to run it - a hand run by another route - so it stays refused on every
+    ref, main included."""
+    for ref in ("refs/heads/main", "refs/heads/ppa-1614"):
+        environ = {**CLOSE_OUT_ENV, "GITHUB_EVENT_NAME": "workflow_dispatch",
+                   "GITHUB_REF": ref}
+        assert pt_transition.merge_close_out_run(environ) is False
+
+
 def test_in_progress_to_done_fires_inside_the_close_out_run(ppa_plan):
     """The hop the two refused runs asked for, end to end. It fires the live
     "Closed - No client approval required" transition, which is the one
