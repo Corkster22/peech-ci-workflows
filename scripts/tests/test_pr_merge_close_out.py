@@ -3003,3 +3003,36 @@ def test_a_plain_text_close_out_splits_on_its_key_headings_too():
              "1. The arm sweep skips a draft. NOT MET."]
     assert [(r.number, r.verdict) for r in closeout.section_rows(
         lines, "PPA-1613")] == [(3, "MET"), (1, "NOT MET")]
+
+
+# --------------------------------------------------------------------------
+# PPA-1657 — only a line led by its key opens that key's section
+# --------------------------------------------------------------------------
+
+def test_a_prose_line_naming_another_key_above_the_checklist_opens_nothing():
+    """Every row is filed against the ticket being graded, not PPA-1619."""
+    verdicts = ["MET"] * 5 + ["NOT MET", "MET"]
+    comment = {"body": {"type": "doc", "version": 1, "content": [
+        {"type": "paragraph", "content": [{"type": "text", "text":
+         "Blocked by PPA-1619, now merged."}]},
+        *adf_table([(n, text, verdict, "Below") for n, (text, verdict)
+                    in enumerate(zip(PPA_1612, verdicts), 1)])["content"]]}}
+
+    stated, used, defects = closeout.merged_verdicts(
+        [comment], list(PPA_1612), "PPA-1612")
+
+    assert stated == dict(enumerate(verdicts, 1))
+    assert used == [comment]
+    assert defects == []
+
+
+@pytest.mark.parametrize("heading", [
+    "## PPA-1612", "**PPA-1612**", "PPA-1612 - close-out"])
+def test_a_line_led_by_the_key_opens_its_section(heading):
+    lines = ["PPA-1613",
+             "1. The arm sweep skips a draft. NOT MET.",
+             heading,
+             "1. The hook reads the dispatch keys. MET."]
+
+    assert [(r.number, r.verdict) for r in closeout.section_rows(
+        lines, "PPA-1612")] == [(1, "MET")]
