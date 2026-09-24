@@ -404,6 +404,33 @@ still files, because the pairing decides and the number was only ever a label.
 imports, so a session reads it before writing its close-out. Widening the parser alone leaves the next shape to be found by a
 failure instead of by a rule.
 
+One ticket's rows in a multi-ticket close-out — PPA-1656
+--------------------------------------------------------
+**A line that is not a checklist row and names exactly one PPA key opens that
+key's section, and the section runs to the next such line. A ticket is graded
+against the rows in its own sections and the rows before the first one.**
+
+Why it needed deciding. The PPA-1555 boundary above splits one text into
+checklists but says nothing about whose each one is, so every row in a comment
+was paired against every ticket that comment sat on. PR #129 in
+peech-pmo-automation carried PPA-1612 and PPA-1613 under one close-out, seven
+conditions each; the merge read it as no close-out checklist and left both
+tickets at In Progress. ``section_rows`` supplies the owner: the heading above
+a row, which PPA-1619's amendment makes the required shape for a close-out
+covering more than one ticket.
+
+Rows before the first key heading belong to every key. A comment with no key
+heading is therefore one section belonging to every key and reads exactly as it
+did before, and a single-ticket close-out that names another key only after its
+checklist - "this unblocks PPA-1619" - keeps its rows.
+
+What this rule costs, stated rather than discovered later: a prose line naming
+one other key *before* the checklist - "blocked by PPA-1619, now merged" - opens
+that key's section, so the rows under it are filed against PPA-1619 and the
+ticket being graded reads as having no checklist. It is held at In Progress
+with the held notice, which a person reads; it is not closed on another
+ticket's rows. A line naming two keys or more opens nothing.
+
 A held ticket gets a second reader — PPA-1556
 ----------------------------------------------
 The merge run reads a ticket's comments once, on the merge event, and nothing
@@ -980,20 +1007,7 @@ def stated_rows(lines):
     seen = set()
     previous = None
     for raw in lines:
-        cells = table_cells(raw)
-        if cells is not None:
-            row = row_verdict(cells)
-        else:
-            line = _BOLD_RE.sub("", raw)
-            head = _ROW_RE.match(line)
-            if not head:
-                continue
-            rest = line[head.end():]
-            verdict = _VERDICT_RE.search(rest)
-            row = verdict and StatedRow(
-                int(head.group(1)),
-                " ".join(rest[:verdict.start()].split()).strip(" .:;—–-"),
-                " ".join(verdict.group(1).split()).upper())
+        row = _row_in(raw)
         if not row:
             continue
         if row.number == 1 and previous is not None and previous > 1:
@@ -1007,6 +1021,49 @@ def stated_rows(lines):
             seen.add(row.number)
             found.append(row)
     return found
+
+
+def _row_in(raw):
+    """The ``StatedRow`` one line states, or None where it is not a row."""
+    cells = table_cells(raw)
+    if cells is not None:
+        return row_verdict(cells)
+    line = _BOLD_RE.sub("", raw)
+    head = _ROW_RE.match(line)
+    if not head:
+        return None
+    rest = line[head.end():]
+    verdict = _VERDICT_RE.search(rest)
+    return verdict and StatedRow(
+        int(head.group(1)),
+        " ".join(rest[:verdict.start()].split()).strip(" .:;—–-"),
+        " ".join(verdict.group(1).split()).upper())
+
+
+def section_rows(lines, key):
+    """The rows in one PPA key's section of a close-out, in written order.
+
+    See "One ticket's rows in a multi-ticket close-out" in the module
+    docstring. A line that is not a checklist row and names exactly one PPA key
+    opens that key's section, which runs to the next such line. Rows before the
+    first such line belong to every key, so a comment with none reads exactly
+    as ``stated_rows`` reads it.
+
+    Takes lines for the same reason ``stated_rows`` does: the merge passes
+    ``adf_lines(body)`` and the Stop grader passes ``text.splitlines()``.
+    """
+    key = key.upper()
+    kept = []
+    owner = None
+    for raw in lines:
+        if _row_in(raw) is None:
+            named = keys_in(raw)
+            if len(named) == 1:
+                owner = named[0]
+                continue
+        if owner is None or owner == key:
+            kept.append(raw)
+    return stated_rows(kept)
 
 
 #: A word that discriminates between two conditions not at all, dropped before
@@ -1142,19 +1199,28 @@ def pair_rows(conditions, rows):
     return Pairing(verdicts, defects)
 
 
-def checklist_comments(comments):
+def checklist_comments(comments, key=None):
     """[(comment, rows)] for every comment stating at least one row, oldest
-    first. A comment stating none is not part of the close-out at all."""
+    first. A comment stating none is not part of the close-out at all.
+
+    With a key, only the rows in that key's section count - see
+    ``section_rows``. Without one, every row in the comment does.
+    """
     found = []
     for comment in comments or []:
-        rows = stated_rows(adf_lines(comment.get("body")))
+        lines = adf_lines(comment.get("body"))
+        rows = stated_rows(lines) if key is None else section_rows(lines, key)
         if rows:
             found.append((comment, rows))
     return found
 
 
-def merged_verdicts(comments, conditions):
+def merged_verdicts(comments, conditions, key=None):
     """(verdicts, the comments used, the defects found) across every checklist.
+
+    ``key`` is the ticket being graded. Each comment is read for the rows in
+    that key's section only, since PPA-1656, so a multi-ticket close-out files
+    no row against a ticket it does not name. With no key, every row counts.
 
     Recency is not the selector - see "Which comments count as the close-out"
     in the module docstring. The base is the most complete checklist, later
@@ -1178,7 +1244,7 @@ def merged_verdicts(comments, conditions):
     reports as an absent checklist rather than as a table of UNSTATED rows.
     """
     found = [(comment, pair_rows(conditions, rows))
-             for comment, rows in checklist_comments(comments)]
+             for comment, rows in checklist_comments(comments, key)]
     if not found:
         return {}, [], []
 
@@ -1240,13 +1306,13 @@ class VerdictTable:
                 f"account.")
 
 
-def build_table(dod, comments):
+def build_table(dod, comments, key=None):
     """Pair every condition against the verdict the close-out stated for it."""
     conditions = conditions_in(dod)
     if not conditions:
         return VerdictTable([], "no Definition of Done to pair against")
 
-    stated, used, defects = merged_verdicts(comments, conditions)
+    stated, used, defects = merged_verdicts(comments, conditions, key)
     if not used:
         return VerdictTable([], "no close-out checklist on the ticket",
                             conditions=conditions, absent=True)
@@ -1327,7 +1393,7 @@ def table_already_posted(comments, sha):
                for c in comments or [])
 
 
-def safe_table(dod, comments):
+def safe_table(dod, comments, key=None):
     """The verdict table, or None when it cannot be built. Never raises.
 
     PPA-1459 made this reading load-bearing for routing as well as reporting,
@@ -1335,7 +1401,7 @@ def safe_table(dod, comments):
     path: plan_transition() routes it to Client Validation, never to Done.
     """
     try:
-        return build_table(dod, comments)
+        return build_table(dod, comments, key)
     except Exception:            # noqa: BLE001 - never fail a merge over it
         return None
 
@@ -1679,7 +1745,7 @@ def close_out(get, post, key, sha, pr_number, date, dry_run=False):
     # close-out and decides the destination. The hash comment is already posted
     # by this point, so a key reaching Done satisfies the graduation gate's
     # second requirement at the moment its status changes.
-    table = safe_table(dod, comments)
+    table = safe_table(dod, comments, key)
     note = f"{note}; {post_table(post, key, table, comments, sha, dry_run)}"
 
     # PPA-1601: a key at To Do is moved to In Progress, then graded as if it
@@ -1824,7 +1890,7 @@ def regrade(get, post, key, dry_run=False):
         return Outcome(key, "SKIPPED",
                        "carries no held comment; never held by this workflow")
 
-    table = safe_table(fields.get("customfield_10767"), comments)
+    table = safe_table(fields.get("customfield_10767"), comments, key)
     target, reason, failures = plan_transition(status, table)
     if target is None:
         return Outcome(key, "HELD", f"still held - {reason}")

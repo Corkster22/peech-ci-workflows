@@ -51,19 +51,23 @@ configuration from `inputs` and `secrets`, not `vars`.
 
 ## Run Instructions
 
-Nothing here runs locally except the suite. A workflow runs only when a caller
-invokes it; `pytest.yml` alone runs on this repository's own pull requests and
-pushes to `main`. No schedule runs, and no secret is stored here.
+Nothing here runs locally except the suite. `pytest.yml` runs on this
+repository's own pull requests and pushes to `main`, and `merge-close-out.yml`
+runs on push to `main` under this repository's own `JIRA_EMAIL` and
+`JIRA_API_TOKEN` secrets. Every other workflow runs only when a caller invokes
+it. No schedule runs, and no secret is stored in the repository's files.
 
-This repository calls none of its own workflows, so no workflow opens, arms or
-closes out a pull request here. That replaces the Delegation block's close-out
-bullet for this repository only:
+`merge-close-out.yml` records the merge hash and applies the close-out
+transition on this repository's own merges to `main`. No workflow opens or arms
+a pull request here, because this repository calls neither `pr-open.yml` nor
+`auto-merge-arm.yml`. That replaces the Delegation block's close-out bullet for
+this repository only:
 
 - The session commits to `ppa-<key>`, posts its close-out checklist on each
   ticket, then pushes and stops.
 - The conductor opens the pull request and merges it once `pytest` passes.
-- No merge here records a hash or applies a transition. The conductor does
-  both by hand.
+- The merge records its hash on each key and applies the close-out transition
+  through `merge-close-out.yml`, as it does in a calling repository.
 - No `UserPromptSubmit` hook runs here, so a dispatch does not move its keys to
   In Progress.
 - If the push is refused, the session stops and reports the staged files. The
