@@ -14,6 +14,7 @@ import json
 import re
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pr_merge_close_out as closeout
 import pytest
@@ -2888,3 +2889,117 @@ def test_the_workflow_passes_the_channel_input_and_the_token():
     assert step["env"][closeout.TOKEN_VAR] == "${{ secrets.SLACK_BOT_TOKEN }}"
     assert not re.search(r"xox[abprs]-", text), "a Slack token is in the file"
     assert not re.search(r"\bC0[A-Z0-9]{6,}\b", text), "a channel id is in the file"
+
+
+# --------------------------------------------------------------------------
+# PPA-1656 — one ticket's rows in a multi-ticket close-out
+# --------------------------------------------------------------------------
+# PR #129 in peech-pmo-automation carried PPA-1612 and PPA-1613 under one
+# close-out, seven conditions each. The shape PPA-1619's amendment fixes: a
+# heading naming the key opens each ticket's rows, and each row keeps its
+# condition number as its first cell. The last two conditions are the standing
+# ones every Delegated ticket carries, so both tickets quote them in the same
+# words - which is what let one ticket's rows file against the other.
+
+SHARED = ("python3 -m pytest scripts/ pass and fail counts are quoted.",
+          "Every finding names one of the three outcomes.")
+PPA_1612 = ("The hook reads the dispatch keys from the prompt.",
+            "A key at To Do moves to In Progress on dispatch.",
+            "A key at Reopened moves to In Progress on re-dispatch.",
+            "A key already at In Progress is left alone.",
+            "The hook exits zero when Jira cannot be reached.") + SHARED
+PPA_1613 = ("The arm sweep skips a draft pull request.",
+            "The quiet window is read from the branch's last push.",
+            "A pull request already armed is not armed again.",
+            "The sweep names each pull request it armed.",
+            "The sweep runs on the half-hour schedule.") + SHARED
+
+
+def keyed_close_out(*sections):
+    """One comment carrying several tickets' checklists, each under a heading
+    naming its key - an ADF heading, then an ADF table, per section."""
+    content = [{"type": "paragraph", "content": [{"type": "text", "text":
+                "Close-out for PPA-1612 and PPA-1613, local commit 1a2b3c4."}]}]
+    for key, conditions, verdicts in sections:
+        content.append({"type": "heading", "attrs": {"level": 3}, "content": [
+            {"type": "text", "text": f"{key} - Definition of Done"}]})
+        content += adf_table([(n, text, verdict, "Below") for n, (text, verdict)
+                              in enumerate(zip(conditions, verdicts), 1)])["content"]
+    return {"body": {"type": "doc", "version": 1, "content": content}}
+
+
+#: PPA-1612 reports its findings condition not met and PPA-1613 reports its
+#: own met, so a row filed against the wrong ticket changes a verdict.
+PR_129 = keyed_close_out(
+    ("PPA-1612", PPA_1612, ["MET"] * 6 + ["NOT MET"]),
+    ("PPA-1613", PPA_1613, ["MET"] * 7))
+
+
+def test_pr_129_close_out_grades_each_ticket_against_its_own_seven_rows():
+    for key, conditions, expected in (
+            ("PPA-1612", PPA_1612, {**dict.fromkeys(range(1, 7), "MET"),
+                                    7: "NOT MET"}),
+            ("PPA-1613", PPA_1613, dict.fromkeys(range(1, 8), "MET"))):
+        stated, used, defects = closeout.merged_verdicts(
+            [PR_129], list(conditions), key)
+
+        assert stated == expected, f"{key} was graded against another's rows"
+        assert len(stated) == 7
+        assert used == [PR_129]
+        assert defects == [], f"{key} was handed rows it does not own"
+
+
+def test_pr_129_close_out_files_no_row_against_a_ticket_it_does_not_name():
+    stated, used, defects = closeout.merged_verdicts(
+        [PR_129], list(PPA_1612), "PPA-1619")
+    assert (stated, used, defects) == ({}, [], [])
+
+
+class KeyedJira(StubJira):
+    """StubJira answering each key with its own Definition of Done."""
+
+    def __init__(self, dods, comments):
+        super().__init__(comments=comments)
+        self.dods = dods
+
+    def get(self, path):
+        issue = super().get(path)
+        key = path.split("/")[2].split("?")[0]
+        issue["fields"]["customfield_10767"] = self.dods[key]
+        return issue
+
+
+def test_the_pr_129_merge_posts_seven_verdicts_per_ticket(never_shell_out):
+    """The same replay through run(), which is the path the merge takes."""
+    jira = KeyedJira({"PPA-1612": dod(*PPA_1612), "PPA-1613": dod(*PPA_1613)},
+                     [PR_129])
+
+    run(jira.get, jira.post, ["PPA-1612", "PPA-1613"], SHA, "129", DATE)
+
+    def table_on(key):
+        mine = [p for p in jira.posts if p[0] == f"/issue/{key}/comment"]
+        return rows_of(table_posted(SimpleNamespace(posts=mine)))
+
+    assert table_on("PPA-1612") == [(n, "MET") for n in range(1, 7)] + [
+        (7, "NOT MET")]
+    assert table_on("PPA-1613") == [(n, "MET") for n in range(1, 8)]
+
+
+def test_a_close_out_with_no_key_heading_is_one_section_for_every_key():
+    lines = ["Close-out for PPA-1612 and PPA-1613.",
+             "1. The hook reads the dispatch keys. MET.",
+             "2. A key at To Do moves. NOT MET."]
+    assert closeout.section_rows(lines, "PPA-1612") == closeout.stated_rows(lines)
+    assert closeout.section_rows(lines, "ppa-1613") == closeout.stated_rows(lines)
+
+
+def test_a_plain_text_close_out_splits_on_its_key_headings_too():
+    """The Stop grader's shape: a turn's output as lines, never ADF. Rows
+    before the first heading belong to every key."""
+    lines = ["3. Preamble row. MET.",
+             "PPA-1612",
+             "1. The hook reads the dispatch keys. MET.",
+             "PPA-1613 close-out",
+             "1. The arm sweep skips a draft. NOT MET."]
+    assert [(r.number, r.verdict) for r in closeout.section_rows(
+        lines, "PPA-1613")] == [(3, "MET"), (1, "NOT MET")]
