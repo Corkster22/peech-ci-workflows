@@ -6,9 +6,13 @@ name: Auto-Merge — Arm
 # a quiet-window sweep (PPA-1391) and why the sweep is the fallback behind the
 # SessionEnd hook (PPA-1407). The step and its rules are unchanged.
 #
-# A called workflow cannot carry a schedule, so the caller keeps its own
-# `schedule: */30` and `workflow_dispatch` triggers and passes its own
-# PEECH_AUTOMATION_TOKEN. No secret is stored here.
+# A caller's schedule does not travel through workflow_call, so each caller
+# keeps its own `schedule: */30` and `workflow_dispatch` triggers and passes its
+# own PEECH_AUTOMATION_TOKEN. No secret is stored here.
+#
+# PPA-1658. This repository sweeps its own pull requests by carrying the same
+# two triggers on this file, the own-trigger pattern merge-close-out.yml uses
+# here, under its own PEECH_AUTOMATION_TOKEN secret.
 #
 # This arms; it never merges. `--auto --squash` only, so the required checks
 # decide exactly as they do today.
@@ -28,6 +32,9 @@ permissions:
   pull-requests: write
 
 on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
   workflow_call:
     secrets:
       PEECH_AUTOMATION_TOKEN:
@@ -61,6 +68,10 @@ jobs:
       # itself.
       #
       # No checkout step. Nothing here reads the repository.
+      #
+      # PPA-1658, considered and dropped: actionlint's shellcheck flags the
+      # backticks in the job-summary printf below as SC2016 (info). They are
+      # Markdown code spans and are meant literally, so nothing breaks.
       - name: Arm every quiet ticket pull request, or log why not
         env:
           GH_TOKEN: ${{ secrets.PEECH_AUTOMATION_TOKEN }}

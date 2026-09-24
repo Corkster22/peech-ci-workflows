@@ -2,8 +2,14 @@ name: Pull Request — Open
 
 # PPA-1590. peech-pmo-automation's pr-open.yml at origin/main fadfc00, served as
 # a callable workflow. The header history lives in that copy; the steps and
-# their rules are unchanged. The caller keeps its own `push` to `ppa-*` trigger
+# their rules are unchanged. A caller keeps its own `push` to `ppa-*` trigger
 # and passes its own credentials; no secret is stored here.
+#
+# PPA-1658. This repository opens and arms its own pull requests by running this
+# file directly on push to a `ppa-*` branch, the own-trigger pattern
+# merge-close-out.yml uses here. On that push the secrets are this repository's
+# own PEECH_AUTOMATION_TOKEN, JIRA_EMAIL and JIRA_API_TOKEN, and the second
+# checkout below lands on this repository's main, as it would for a caller.
 #
 # Two adaptations, both forced by workflow_call rather than chosen:
 #
@@ -23,6 +29,9 @@ permissions:
   pull-requests: write
 
 on:
+  push:
+    branches:
+      - "ppa-*"
   workflow_call:
     secrets:
       PEECH_AUTOMATION_TOKEN:
@@ -184,7 +193,7 @@ jobs:
 
           echo "branch: ${HEAD_REF}"
 
-          # Guard 1 — the branch name matches ppa-*. The caller's `branches:`
+          # Guard 1 — the branch name matches ppa-*. The trigger's `branches:`
           # filter already enforces this; the guard stays because a filter and a
           # rule are different things, and this job should refuse a branch it
           # was somehow handed rather than assume the trigger vouched for it.

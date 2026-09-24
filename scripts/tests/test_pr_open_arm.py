@@ -150,3 +150,12 @@ def test_arm_job_permissions_fit_the_caller_grant():
 
     assert flow["jobs"]["arm"]["permissions"] == grant
     assert flow["permissions"] == grant
+
+
+def test_push_to_a_ppa_branch_is_a_trigger_beside_workflow_call():
+    """PPA-1658 — this repository opens its own pull requests."""
+    # PyYAML reads the bare key `on` as the boolean True.
+    on = workflow()[True]
+
+    assert list(on) == ["push", "workflow_call"]
+    assert on["push"] == {"branches": ["ppa-*"]}
