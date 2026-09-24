@@ -10,10 +10,11 @@ name: Merge Close-Out — Record
 # rule expressed in a workflow step cannot be unit-tested.
 #
 # The caller's file must itself be .github/workflows/merge-close-out.yml, on
-# push to main. The github context of a called workflow is the caller's, and
-# pt_transition.merge_close_out_run() reads GITHUB_WORKFLOW_REF, GITHUB_EVENT_NAME
-# and GITHUB_REF to recognise a close-out run, so a caller under another name or
-# trigger is refused the In Progress to Done hop.
+# push to main or on its schedule. The github context of a called workflow is
+# the caller's, and pt_transition.merge_close_out_run() reads
+# GITHUB_WORKFLOW_REF, GITHUB_EVENT_NAME and GITHUB_REF to recognise a close-out
+# run, so a caller under another name or trigger, or a manual dispatch, is
+# refused the In Progress to Done hop.
 #
 # PPA-1614. The re-grade runs when a caller passes `regrade: true` from its
 # schedule trigger, as `regrade: ${{ github.event_name == 'schedule' }}`. Each
