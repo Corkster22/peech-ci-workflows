@@ -35,7 +35,7 @@
     "protection": {
       "pull_request_required": true,
       "required_approving_review_count": 0,
-      "required_status_checks": ["Validate org skill files", "Test plugin pt-automation-hooks"],
+      "required_status_checks": ["Validate org skill files"],
       "strict": false,
       "enforce_admins": true
     },

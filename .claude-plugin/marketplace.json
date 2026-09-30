@@ -1,0 +1,16 @@
+{
+  "name": "peech-ci",
+  "owner": {
+    "name": "Sean Corcoran"
+  },
+  "metadata": {
+    "description": "Shared Claude Code hooks for the Peech repositories"
+  },
+  "plugins": [
+    {
+      "name": "pt-automation-hooks",
+      "source": "./plugins/pt-automation-hooks",
+      "description": "Shared Claude Code hooks: dispatch transition, spawn control, CLAUDE.md and Definition of Done gates, auto-merge arming"
+    }
+  ]
+}
