@@ -1,0 +1,7 @@
+{
+  "name": "pt-automation-hooks",
+  "description": "Peech Tech shared Claude Code hooks: moves every dispatched PPA key to In Progress, refuses a spawned ticket the session should fix, grades touched CLAUDE.md files and the Definition of Done at Stop, and arms auto-merge at SessionEnd",
+  "author": {
+    "name": "Sean Corcoran"
+  }
+}

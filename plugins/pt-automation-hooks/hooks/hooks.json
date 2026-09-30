@@ -1,0 +1,93 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "r=\"${CLAUDE_PLUGIN_ROOT:-}\"; if [ -z \"$r\" ]; then r=$(ls -dt \"$HOME\"/.claude/plugins/cache/peech-ci/pt-automation-hooks/*/ 2>/dev/null | head -1); r=\"${r%/}\"; fi; h=\"$r/hooks/refresh_ci_workflows.py\"; if [ ! -f \"$h\" ]; then exit 0; fi; exec python3 \"$h\"",
+            "timeout": 60,
+            "statusMessage": "Checking the peech-ci-workflows clone against origin/main..."
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "r=\"${CLAUDE_PLUGIN_ROOT:-}\"; if [ -z \"$r\" ]; then r=$(ls -dt \"$HOME\"/.claude/plugins/cache/peech-ci/pt-automation-hooks/*/ 2>/dev/null | head -1); r=\"${r%/}\"; fi; h=\"$r/hooks/transition_on_prompt.py\"; if [ ! -f \"$h\" ]; then printf '{\"systemMessage\": \"pt-automation-hooks: CLAUDE_PLUGIN_ROOT is unset and no cached copy of the plugin was found, so no PPA key was moved to In Progress.\"}\\n'; exit 0; fi; exec python3 \"$h\""
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "mcp__atlassian-rovo__createJiraIssue",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "r=\"${CLAUDE_PLUGIN_ROOT:-}\"; if [ -z \"$r\" ]; then r=$(ls -dt \"$HOME\"/.claude/plugins/cache/peech-ci/pt-automation-hooks/*/ 2>/dev/null | head -1); r=\"${r%/}\"; fi; h=\"$r/hooks/deny_in_scope_spawn.py\"; if [ ! -f \"$h\" ]; then exit 0; fi; exec python3 \"$h\"",
+            "timeout": 30,
+            "statusMessage": "Checking whether this finding sits inside the dispatched ticket's scope..."
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "r=\"${CLAUDE_PLUGIN_ROOT:-}\"; if [ -z \"$r\" ]; then r=$(ls -dt \"$HOME\"/.claude/plugins/cache/peech-ci/pt-automation-hooks/*/ 2>/dev/null | head -1); r=\"${r%/}\"; fi; h=\"$r/hooks/deny_push_without_checklist.py\"; if [ ! -f \"$h\" ]; then exit 0; fi; exec python3 \"$h\"",
+            "timeout": 30,
+            "statusMessage": "Checking the close-out checklist is on the ticket before this push..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__atlassian-rovo__createJiraIssue",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "r=\"${CLAUDE_PLUGIN_ROOT:-}\"; if [ -z \"$r\" ]; then r=$(ls -dt \"$HOME\"/.claude/plugins/cache/peech-ci/pt-automation-hooks/*/ 2>/dev/null | head -1); r=\"${r%/}\"; fi; h=\"$r/hooks/label_spawned_ticket.py\"; if [ ! -f \"$h\" ]; then exit 0; fi; exec python3 \"$h\"",
+            "timeout": 30,
+            "statusMessage": "Labelling the new ticket as spawned and linking it to its origin..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "r=\"${CLAUDE_PLUGIN_ROOT:-}\"; if [ -z \"$r\" ]; then r=$(ls -dt \"$HOME\"/.claude/plugins/cache/peech-ci/pt-automation-hooks/*/ 2>/dev/null | head -1); r=\"${r%/}\"; fi; h=\"$r/hooks/check_claudemd.py\"; if [ ! -f \"$h\" ]; then echo \"Stop hook: $h is missing, so the CLAUDE.md gate cannot run. Refusing to pass silently.\" >&2; exit 2; fi; python3 \"$h\"; rc=$?; if [ \"$rc\" -eq 3 ]; then echo \"Stop hook: $h reports the CLAUDE.md gate did not run (exit 3). Refusing to pass silently.\" >&2; exit 2; fi; if [ \"$rc\" -ne 0 ] && [ \"$rc\" -ne 2 ]; then echo \"Stop hook: $h exited $rc, which is none of its codes 0 (pass), 2 (findings) and 3 (gate did not run), so it reached no verdict. Refusing to pass silently.\" >&2; exit 2; fi; exit \"$rc\"",
+            "timeout": 120,
+            "statusMessage": "Grading the CLAUDE.md files this session touched..."
+          },
+          {
+            "type": "command",
+            "command": "r=\"${CLAUDE_PLUGIN_ROOT:-}\"; if [ -z \"$r\" ]; then r=$(ls -dt \"$HOME\"/.claude/plugins/cache/peech-ci/pt-automation-hooks/*/ 2>/dev/null | head -1); r=\"${r%/}\"; fi; h=\"$r/hooks/grade_definition_of_done.py\"; if [ ! -f \"$h\" ]; then echo \"Stop hook: $h is missing, so the Definition of Done gate cannot run. Refusing to pass silently.\" >&2; exit 2; fi; exec python3 \"$h\"",
+            "timeout": 60,
+            "statusMessage": "Grading this session's Definition of Done conditions..."
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "r=\"${CLAUDE_PLUGIN_ROOT:-}\"; if [ -z \"$r\" ]; then r=$(ls -dt \"$HOME\"/.claude/plugins/cache/peech-ci/pt-automation-hooks/*/ 2>/dev/null | head -1); r=\"${r%/}\"; fi; h=\"$r/hooks/arm_auto_merge.py\"; if [ -f \"$h\" ]; then python3 \"$h\"; else printf '{\"at\":\"%s\",\"outcome\":\"hook-file-missing\",\"path\":\"%s\"}\\n' \"$(date -Iseconds)\" \"$h\" >> \"$HOME/.claude/arm-auto-merge-hook.log\"; fi",
+            "timeout": 60,
+            "statusMessage": "Arming auto-merge on this session's pull request..."
+          }
+        ]
+      }
+    ]
+  }
+}

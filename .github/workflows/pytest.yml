@@ -32,3 +32,15 @@ jobs:
 
       - name: Run the suite
         run: python3 -m pytest scripts/ -v
+
+      # PPA-1743. The plugin's hooks read scripts/ from the peech-ci-workflows
+      # clone under ~/Documents/Claude-Projects and abort collection without
+      # it, so the runner links this checkout there. Mirrors PPA-1605.
+      - name: Link this checkout where the hooks read it
+        run: |
+          mkdir -p "$HOME/Documents/Claude-Projects"
+          ln -s "$GITHUB_WORKSPACE" "$HOME/Documents/Claude-Projects/peech-ci-workflows"
+
+      - name: Run the plugin suite
+        working-directory: plugins/pt-automation-hooks
+        run: python3 -m pytest tests/ -v
