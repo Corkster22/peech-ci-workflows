@@ -16,9 +16,12 @@ What it does, in order
    note (Amendment 1), the older "Execute PPA-XXX." form, or the same line
    beneath a ``<pasted_content>`` tag. A turn with no key is skipped.
 4. Posts only when the Jira identity in the credentials file is Sean's.
-5. Skips each turn whose tag is already in Sean's Tempo worklogs for its date.
-   Splits each other turn evenly across its keys, remainder seconds to the
-   first, so the parts sum to the turn, and posts with ``billableSeconds`` 0.
+5. Splits each turn evenly across its keys, remainder seconds to the first, so
+   the parts sum to the turn. A key's part counts as posted when its tag is in
+   a worklog description on that key's issue. A part of a minute or more posts
+   as its own worklog with ``billableSeconds`` 0. A shorter part is held, never
+   rounded up, because Tempo refuses under 60 seconds, and a key's held parts
+   post as one worklog, carrying every tag it covers, once they reach 60.
 
 Why every row, not the latest
 -----------------------------
@@ -31,11 +34,13 @@ every row not yet tagged in Tempo catches up on the next Stop.
 
 The residual: a session's final turn posts only when a later Stop in that
 session finds its row, or when PPA-1756's catch-up script is re-run. Nothing
-fires after the last Stop, so without one of those that turn goes unposted.
+fires after the last Stop, so without one of those that turn goes unposted. The
+same holds for a key's held remainder under a minute when a session ends.
 
 The tag is ``cc-turn:<session_id>:<uuid of the turn_duration row>``, carried as
-the whole description. PPA-1756's catch-up writes the same tag, so a turn
-either one posted is never posted by the other. ``CUTOFF`` keeps turns that
+the whole description of a worklog for one turn, and space-separated with its
+fellows in a worklog for held parts. PPA-1756's catch-up writes the same tag,
+so a part either one posted is never posted by the other. ``CUTOFF`` keeps turns that
 the untagged 23-SEP backfill already covered from posting twice.
 
 Fail open
@@ -46,9 +51,9 @@ credentials, a parse error, a network, Tempo or Jira error - is caught,
 written as one line to ``LOG`` naming the turn, the reason and the time, and
 the hook exits 0. The hooks.json wrapper is fail-open and carries a timeout,
 and ``DEADLINE`` stops this file's own calls before that timeout does, so a
-slow Tempo never holds a turn open. A turn that fails on its own data, such as
-a key Jira cannot resolve, is logged and the rows after it still post. A
-network or timeout failure ends the run, and the next Stop retries.
+slow Tempo never holds a turn open. A key that fails on its own data, such as
+one Jira cannot resolve, is logged and the other keys still post. A network or
+timeout failure ends the run, and the next Stop retries.
 
 This hook never deletes or edits a worklog. Tempo DELETE leaves the Jira
 mirror worklog behind, so undoing a post means deleting both sides.
@@ -76,6 +81,8 @@ TEMPO = "https://api.tempo.io/4"
 ET = ZoneInfo("America/New_York")
 #: A turn ending before this was covered by the untagged 23-SEP backfill.
 CUTOFF = datetime(2026, 9, 24, tzinfo=ET)
+#: Tempo refuses a worklog under one minute with HTTP 400 (Amendment 2).
+MIN_SECONDS = 60
 HTTP_TIMEOUT = 5
 #: Seconds this file spends on HTTP before it gives up. hooks.json allows more.
 DEADLINE = 25
@@ -244,42 +251,69 @@ class Poster:
             self.ids[key] = int(issue["id"])
         return self.ids[key]
 
-    def posted(self, start_date, turn_tag):
-        """True when a worklog of Sean's on that date already carries the tag."""
-        if start_date not in self.descriptions:
-            found, url = [], (f"{TEMPO}/worklogs/user/{SEAN}"
-                              f"?from={start_date}&to={start_date}&limit=1000")
+    def posted(self, issue, turn_tag):
+        """True when a worklog on that issue already carries the tag."""
+        if issue not in self.descriptions:
+            found, url = [], f"{TEMPO}/worklogs/issue/{issue}?limit=1000"
             for _ in range(MAX_PAGES):
                 page = http_json("GET", url, self.tempo)
                 found += [w.get("description") or "" for w in page.get("results", [])]
                 url = (page.get("metadata") or {}).get("next")
                 if not url:
                     break
-            self.descriptions[start_date] = found
-        return any(turn_tag in d for d in self.descriptions[start_date])
+            self.descriptions[issue] = found
+        return any(turn_tag in d for d in self.descriptions[issue])
 
-    def post(self, row, keys, turn_tag):
-        """Post the turn, unless its tag is already in Tempo."""
+    def post(self, issue, parts):
+        """One worklog for ``parts``: their total, every tag they cover, and
+        the start of the first."""
+        row = parts[0][2]
         start = (ended(row) - timedelta(milliseconds=row["durationMs"])).astimezone(ET)
-        start_date, start_time = start.strftime("%Y-%m-%d"), start.strftime("%H:%M:%S")
-        if self.posted(start_date, turn_tag):
-            return
-        # Every key resolves before the first post: a tag in Tempo marks the
-        # turn done, so a turn left half posted would never be completed.
-        # Considered and dropped: a Tempo failure between two keys' posts of
-        # one multi-key turn still leaves the later keys' share unposted. The
-        # log line names the turn, and the share can be posted by hand. Tag
-        # per key would close it, but PPA-1757 and PPA-1756 both skip a turn
-        # on its tag alone, and the window is one failure inside one turn.
-        ids = {key: self.issue_id(key) for key in keys}
+        http_json("POST", f"{TEMPO}/worklogs", self.tempo, {
+            "issueId": issue, "authorAccountId": SEAN,
+            "startDate": start.strftime("%Y-%m-%d"), "startTime": start.strftime("%H:%M:%S"),
+            "timeSpentSeconds": sum(seconds for _, seconds, _ in parts),
+            "billableSeconds": 0,
+            "description": " ".join(turn_tag for turn_tag, _, _ in parts)})
+
+    def post_key(self, key, parts):
+        """Post this key's parts that are not yet in Tempo, or hold them.
+
+        A part of a minute or more posts as its own worklog. Tempo refuses
+        anything under 60 seconds, so a shorter part is held, never rounded up,
+        and the held parts post as one worklog once they reach 60 seconds
+        (Amendment 2). Whether a part is posted is read per tag and per issue,
+        so a later Stop finishes a multi-key turn that stopped partway.
+
+        The residual: a key's held remainder under 60 seconds when a session
+        ends is never posted, because nothing fires after the last Stop, and a
+        multi-key turn left partway at that point stays partway.
+
+        PPA-1757 considered and dropped: bundling the parts of a minute or more
+        too, so that one Stop posts one worklog per key. Amendment 2 holds only
+        a part under 60 seconds, and PPA-1756 posts one worklog per key under
+        one tag, so this keeps to that. A bundle would change how many worklogs
+        a day carries, never the day's total, so nothing observable breaks if
+        it is never done.
+        """
+        issue = self.issue_id(key)
+        unposted = [part for part in parts if not self.posted(issue, part[0])]
+        for part in (p for p in unposted if p[1] >= MIN_SECONDS):
+            self.post(issue, [part])
+        held = [p for p in unposted if p[1] < MIN_SECONDS]
+        if sum(seconds for _, seconds, _ in held) >= MIN_SECONDS:
+            self.post(issue, held)
+
+
+def parts_by_key(session_id, todo):
+    """Each key's (tag, seconds, row) parts of the turns it was dispatched on."""
+    by_key = {}
+    for row, keys in todo:
         total = (row["durationMs"] + 500) // 1000
         for key, seconds in zip(keys, split_seconds(total, len(keys))):
             if seconds > 0:
-                http_json("POST", f"{TEMPO}/worklogs", self.tempo, {
-                    "issueId": ids[key], "authorAccountId": SEAN,
-                    "startDate": start_date, "startTime": start_time,
-                    "timeSpentSeconds": seconds, "billableSeconds": 0,
-                    "description": turn_tag})
+                by_key.setdefault(key, []).append((tag(session_id, row["uuid"]), seconds, row))
+    return by_key
 
 
 def main():
@@ -293,13 +327,13 @@ def main():
             turn = tag(session_id, todo[0][0]["uuid"])
             poster = Poster(load_env(CREDENTIALS))
             if poster.is_sean():
-                for row, keys in todo:
-                    turn = tag(session_id, row["uuid"])
+                for key, parts in parts_by_key(session_id, todo).items():
+                    turn = parts[0][0]
                     try:
-                        poster.post(row, keys, turn)
+                        poster.post_key(key, parts)
                     except OSError:
                         raise  # network or timeout: end the run, the next Stop retries
-                    except Exception as exc:  # noqa: BLE001 - this turn's own data
+                    except Exception as exc:  # noqa: BLE001 - this key's own data
                         log(turn, f"{type(exc).__name__}: {exc}")
     except Exception as exc:  # noqa: BLE001 - fail open on every path
         log(turn, f"{type(exc).__name__}: {exc}")
