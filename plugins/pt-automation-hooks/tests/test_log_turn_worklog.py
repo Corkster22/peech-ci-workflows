@@ -48,15 +48,16 @@ def turn(**fields):
 class Router:
     """Stands in for http_json and records every request."""
 
-    def __init__(self, *, account=hook.SEAN, existing=(), fail=None, missing=None):
+    def __init__(self, *, account=hook.SEAN, existing=(), fail=None, fail_post=None,
+                 missing=None):
         self.account, self.existing, self.fail = account, list(existing), fail
-        self.missing = missing
+        self.fail_post, self.missing = fail_post, missing
         self.calls = []
 
     def __call__(self, method, url, headers, body=None):
         self.calls.append((method, url, headers, body))
-        if self.fail:
-            raise self.fail
+        if self.fail or (self.fail_post and method == "POST"):
+            raise self.fail or self.fail_post
         if url.endswith("/myself"):
             return {"accountId": self.account}
         if self.missing and f"/issue/{self.missing}?" in url:
@@ -102,27 +103,27 @@ def run(tmp_path, monkeypatch):
 # --- turn parsing -----------------------------------------------------------
 
 
-def test_the_latest_turn_duration_row_is_the_turn(tmp_path):
+def test_every_turn_duration_row_is_a_turn_with_the_keys_in_force(tmp_path):
     path = tmp_path / "t.jsonl"
     older = turn(uuid="older", durationMs=1000)
     path.write_text("\n".join(json.dumps(r) for r in
                               [prompt("PPA-1"), older, prompt("hi"), TURN]))
-    row, keys = hook.latest_turn(path)
-    assert row["uuid"] == TURN_UUID and keys == ["PPA-1"]
+    assert [(row["uuid"], keys) for row, keys in hook.turns(path)] == [
+        ("older", ["PPA-1"]), (TURN_UUID, ["PPA-1"])]
 
 
 def test_a_transcript_with_no_turn_duration_row_has_no_turn(tmp_path):
     path = tmp_path / "t.jsonl"
     path.write_text("\n".join(json.dumps(r) for r in
                               [prompt("PPA-1"), {"type": "assistant"}]))
-    assert hook.latest_turn(path) is None
+    assert hook.turns(path) == []
 
 
 def test_unparseable_lines_and_non_object_rows_are_skipped(tmp_path):
     path = tmp_path / "t.jsonl"
     path.write_text("\n".join(["not json", "[1]", json.dumps(prompt("PPA-1")),
                                json.dumps(TURN)]))
-    assert hook.latest_turn(path)[1] == ["PPA-1"]
+    assert hook.turns(path)[0][1] == ["PPA-1"]
 
 
 def test_a_headless_session_posts_nothing(run):
@@ -153,9 +154,7 @@ def test_the_latest_dispatch_holds_until_the_next(tmp_path):
     rows = [prompt("PPA-1"), turn(uuid="a"), prompt("a question about PPA-9"),
             turn(uuid="b"), prompt("Execute PPA-2."), TURN]
     path.write_text("\n".join(json.dumps(r) for r in rows))
-    assert hook.latest_turn(path)[1] == ["PPA-2"]
-    path.write_text("\n".join(json.dumps(r) for r in rows[:4]))
-    assert hook.latest_turn(path)[1] == ["PPA-1"]
+    assert [keys for _, keys in hook.turns(path)] == [["PPA-1"], ["PPA-1"], ["PPA-2"]]
 
 
 def test_tool_results_and_meta_rows_are_not_dispatches(tmp_path):
@@ -167,7 +166,7 @@ def test_tool_results_and_meta_rows_are_not_dispatches(tmp_path):
             {"type": "user", "message": {"content": [{"type": "text", "text": "PPA-3"}]}},
             TURN]
     path.write_text("\n".join(json.dumps(r) for r in rows))
-    assert hook.latest_turn(path)[1] == ["PPA-3"]
+    assert hook.turns(path)[0][1] == ["PPA-3"]
 
 
 def test_a_turn_with_no_dispatch_posts_nothing(run):
@@ -244,7 +243,8 @@ def test_the_existing_tag_lookup_follows_tempo_paging(monkeypatch):
     seen = []
     monkeypatch.setattr(hook, "http_json",
                         lambda method, url, headers, body=None: seen.append(url) or next(pages))
-    assert hook.tag_posted({}, "2026-09-24", TAG) is True
+    poster = hook.Poster({"JIRA_EMAIL": "e", "JIRA_API_TOKEN": "j", "TEMPO_FM_OAUTH_TOKEN": "t"})
+    assert poster.posted("2026-09-24", TAG) is True
     assert seen[1] == "https://api.tempo.io/next"
 
 
@@ -253,6 +253,80 @@ def test_anyone_but_sean_posts_nothing_and_logs_nothing(run):
                               router=Router(account="712020:someone-else"))
     assert (code, router.posts, lines) == (0, [], [])
     assert [c[1] for c in router.calls] == ["https://peech-team.atlassian.net/rest/api/3/myself"]
+
+
+# --- rows that land after Stop (PPA-1757 finding 1) -------------------------
+#
+# Read off real transcripts on 01-OCT-2026: the turn_duration row is written
+# about 3 ms after the turn's last stop_hook_summary, so the ending turn's row
+# is never there when its own Stop hook runs. The hook posts every row it finds.
+
+
+def _rows(uuid, end, ms=60000):
+    return turn(uuid=uuid, timestamp=end, durationMs=ms)
+
+
+A = _rows("a", "2026-09-30T14:00:00.000Z")
+B = _rows("b", "2026-09-30T15:00:00.000Z")
+
+
+def test_a_lagging_row_is_posted_at_the_next_stop(run):
+    """Stop for turn C: C's row is not written yet, A's and B's are."""
+    _, router, _ = run([prompt("PPA-1"), A, prompt("go"), B, prompt("again")])
+    assert [p["description"] for p in router.posts] == [
+        f"cc-turn:{SESSION}:a", f"cc-turn:{SESSION}:b"]
+
+
+def test_only_rows_not_yet_in_tempo_are_posted(run):
+    router = Router(existing=[f"cc-turn:{SESSION}:a"])
+    _, router, _ = run([prompt("PPA-1"), A, B], router=router)
+    assert [p["description"] for p in router.posts] == [f"cc-turn:{SESSION}:b"]
+
+
+def test_a_run_with_everything_posted_makes_no_post(run):
+    router = Router(existing=[f"cc-turn:{SESSION}:a", f"cc-turn:{SESSION}:b"])
+    code, router, lines = run([prompt("PPA-1"), A, B], router=router)
+    assert (code, router.posts, lines) == (0, [], [])
+    assert not any("/issue/" in c[1] for c in router.calls)
+
+
+def test_tempo_is_read_once_per_start_date(run):
+    _, router, _ = run([prompt("PPA-1"), A, B])
+    reads = [c for c in router.calls if c[0] == "GET" and "tempo.io" in c[1]]
+    assert len(reads) == 1
+
+
+def test_a_row_ending_before_the_cutoff_never_posts(run):
+    """The untagged 23-SEP backfill covers everything before 24-SEP 00:00 ET."""
+    before = _rows("before", "2026-09-24T03:59:59.000Z")
+    at = _rows("at", "2026-09-24T04:00:00.000Z")
+    _, router, _ = run([prompt("PPA-1"), before, at])
+    assert [p["description"] for p in router.posts] == [f"cc-turn:{SESSION}:at"]
+
+
+def test_a_lone_row_before_the_cutoff_posts_nothing(run):
+    code, router, lines = run([prompt("PPA-1"), _rows("old", "2026-09-23T23:00:00.000Z")])
+    assert (code, router.posts, lines) == (0, [], [])
+
+
+def test_the_cutoff_is_midnight_eastern_on_24_sep():
+    assert hook.CUTOFF.isoformat() == "2026-09-24T00:00:00-04:00"
+
+
+def test_one_turn_that_cannot_post_does_not_block_the_rows_after_it(run):
+    rows = [prompt("PPA-2"), A, prompt("PPA-3"), B]
+    code, router, lines = run(rows, router=Router(missing="PPA-2"))
+    assert code == 0
+    assert [(p["issueId"], p["description"]) for p in router.posts] == [
+        (45003, f"cc-turn:{SESSION}:b")]
+    _one_line(lines, turn_name=f"cc-turn:{SESSION}:a", reason="HTTP 404")
+
+
+def test_a_network_failure_stops_the_run_with_one_log_line(run):
+    router = Router(fail_post=TimeoutError("timed out"))
+    code, router, lines = run([prompt("PPA-1"), A, B], router=router)
+    assert code == 0 and len(router.posts) == 1
+    _one_line(lines, turn_name=f"cc-turn:{SESSION}:a", reason="TimeoutError")
 
 
 # --- every failure path exits 0 and writes one log line ---------------------
@@ -309,11 +383,13 @@ def test_an_unreadable_hook_input_exits_0_with_one_log_line(run, payload):
     assert len(lines) == 1
 
 
-def test_a_turn_row_with_no_timestamp_exits_0_with_one_log_line(run):
-    bad = {k: v for k, v in TURN.items() if k != "timestamp"}
+@pytest.mark.parametrize("drop", ["timestamp", "uuid"])
+def test_a_row_it_cannot_time_or_tag_is_skipped_not_a_failure(run, drop):
+    """A row that stays malformed would log at every Stop and block the rows
+    after it, so it is skipped."""
+    bad = {k: v for k, v in TURN.items() if k != drop}
     code, router, lines = run([prompt("PPA-1757"), bad])
-    assert (code, router.posts) == (0, [])
-    _one_line(lines, turn_name=TAG, reason="KeyError")
+    assert (code, router.calls, lines) == (0, [], [])
 
 
 def test_an_unusable_duration_posts_nothing(run):

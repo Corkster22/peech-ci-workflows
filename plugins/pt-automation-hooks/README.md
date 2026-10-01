@@ -13,6 +13,11 @@ nothing.
 
 - Time comes from the transcript's `turn_duration` row. A headless or SDK
   session, or a slash command, writes none, so nothing posts.
+- Claude Code writes a turn's row after that turn's Stop hooks run, so the hook
+  posts every row not yet tagged in Tempo, not only the latest. Rows that
+  ended before 2026-09-24 00:00 ET never post, because the 23-SEP backfill
+  covered them. A session's final turn posts only when a later Stop in that
+  session finds its row, or when PPA-1756's script is re-run.
 - Several keys in the dispatch split the turn evenly. The first key takes the
   remainder seconds.
 - Each worklog carries `billableSeconds` 0 and the tag
