@@ -2762,3 +2762,192 @@ def test_the_listing_orders_blocked_then_held_after_the_set(monkeypatch):
         "PPA-3\tTo Do\tDelegated\tPASS",
         "# not demanded, blocked by PPA-9: PPA-1",
         f"# not demanded, held until {tomorrow}: PPA-2"]
+
+
+# --------------------------------------------------------------------------
+# A Delegated ticket that edits a repository's settings file - PPA-1758
+# --------------------------------------------------------------------------
+
+ROUTE = ("edits .claude/settings.json - work this ticket Guided: chat writes a "
+         "Run Terminal script, the operator runs it (Decision 1A, 01-OCT-2026)")
+
+
+def heading(level, text):
+    return {"type": "heading", "attrs": {"level": level},
+            "content": [{"type": "text", "text": text}]}
+
+
+def para(text):
+    return {"type": "paragraph", "content": [{"type": "text", "text": text}]}
+
+
+def bullets(*items):
+    return {"type": "bulletList", "content": [
+        {"type": "listItem", "content": [para(item)]} for item in items]}
+
+
+def description(*blocks):
+    return {"type": "doc", "version": 1, "content": list(blocks)}
+
+
+def bar_ready(components, description_adf):
+    """The shared read's entry for a ticket that clears every Bar item, so that
+    only the settings check can refuse it."""
+    names = list(components) + ["REPO: peech-ci-workflows"]
+    text = " ".join(hook.flatten_adf(description_adf)) + " Scope boundary"
+    return {"status": "To Do", "components": names,
+            "repo_components": ["REPO: peech-ci-workflows"],
+            "description": text, "dod": "[machine] One condition.",
+            "dod_adf": adf("[machine] One condition."),
+            "description_adf": description_adf}
+
+
+def refusal(components, description_adf, prompt="PPA-9"):
+    return REAL.check_quality_bar(
+        prompt, ["PPA-9"], shared={"PPA-9": bar_ready(components, description_adf)})[0]
+
+
+#: PPA-1757's shape: the file named only in a "Does not touch" list.
+PPA_1757_SHAPE = description(
+    heading(2, "The change"),
+    para("A Stop hook in plugins/pt-automation-hooks/, registered in hooks.json."),
+    heading(2, "Scope boundary"),
+    para("Does not touch:"),
+    bullets("Any repository other than peech-ci-workflows.",
+            ".claude-plugin/marketplace.json, repo-settings.json, or any "
+            "repository's .claude/settings.json.",
+            "Any Claude Code settings file on the Mac."))
+
+#: PPA-1746 step 6: the home-folder file is read without being edited.
+PPA_1746_STEP_6 = description(
+    heading(2, "Change"),
+    para("1. Delete the folder plugins/pt-automation-hooks/ and every file in it."),
+    para("6. Read, without editing, ~/.claude/settings.json, "
+         "~/.claude/plugins/installed_plugins.json and "
+         "~/.claude/plugins/known_marketplaces.json on this Mac."),
+    heading(2, "Scope boundary"),
+    para("Edits the four files named in steps 2 to 5."))
+
+EDITS_SETTINGS = description(
+    heading(2, "Why"),
+    para("The guard refuses the edit."),
+    heading(2, "Change"),
+    para("In .claude/settings.json, replace \"pt-automation-hooks@peech-org\": "
+         "true with \"pt-automation-hooks@peech-ci\": true."),
+    heading(2, "Scope boundary"),
+    para("Does not touch any skill."))
+
+
+def test_a_delegated_ticket_naming_the_file_in_its_change_section_is_refused():
+    message = refusal(["EXA: Delegated"], EDITS_SETTINGS)
+
+    assert f"PPA-9 {ROUTE}" in message
+
+
+def test_a_delegated_ticket_naming_the_file_only_in_its_scope_boundary_is_not():
+    """PPA-1757 is the live example: it names the file only in its "Does not
+    touch" list, and a ticket that lists the file as untouched does not edit
+    it."""
+    assert refusal(["EXA: Delegated"], PPA_1757_SHAPE) is None
+
+
+def test_a_delegated_ticket_naming_only_the_home_file_is_not_refused():
+    """PPA-1746 step 6 is the live example: it reads ~/.claude/settings.json
+    without editing it, and that is the Mac's user settings."""
+    assert refusal(["EXA: Delegated"], PPA_1746_STEP_6) is None
+
+
+@pytest.mark.parametrize("path", [
+    "~/.claude/settings.json", "$HOME/.claude/settings.json",
+    "${HOME}/.claude/settings.json", "/Users/sean/.claude/settings.json",
+    "/home/sean/.claude/settings.json"])
+def test_every_spelling_of_the_home_file_is_the_users_settings(path):
+    ticket = description(heading(2, "Change"), para(f"Read {path} and quote it."))
+    assert refusal(["EXA: Delegated"], ticket) is None
+
+
+@pytest.mark.parametrize("path", [
+    ".claude/settings.json", "peech-skills/.claude/settings.json",
+    "`.claude/settings.json`"])
+def test_a_repository_relative_spelling_is_a_match(path):
+    ticket = description(heading(2, "Change"), para(f"Edit {path} to add a key."))
+    assert refusal(["EXA: Delegated"], ticket) is not None
+
+
+def test_a_change_section_naming_both_files_is_a_match():
+    ticket = description(heading(2, "Change"), para(
+        "Read ~/.claude/settings.json, then edit .claude/settings.json."))
+    assert refusal(["EXA: Delegated"], ticket) is not None
+
+
+def test_a_guided_ticket_naming_the_file_in_its_change_section_is_not_refused():
+    """Guided tickets are never refused by this check. A Guided ticket carries
+    no execution component, so it is the Bar's to refuse, and the settings
+    route is not in what it says."""
+    fields = bar_ready([], EDITS_SETTINGS)
+    assert REAL.edits_repo_settings(fields) is False
+
+    message = REAL.check_quality_bar("PPA-9", ["PPA-9"], shared={"PPA-9": fields})[0]
+    assert ROUTE not in (message or "")
+
+
+def test_a_discovery_ticket_is_not_a_delegated_ticket():
+    assert refusal(["EXA: Delegated Discovery"], EDITS_SETTINGS) is None
+
+
+def test_a_sub_heading_stays_inside_the_change_section_and_the_next_one_ends_it():
+    inside = description(heading(2, "Change"), heading(3, "Step 4"),
+                         para("Edit .claude/settings.json."))
+    after = description(heading(2, "Change"), para("Edit one file."),
+                        heading(2, "Notes"), para("Not .claude/settings.json."))
+
+    assert refusal(["EXA: Delegated"], inside) is not None
+    assert refusal(["EXA: Delegated"], after) is None
+
+
+@pytest.mark.parametrize("title", ["Change", "The change", "Changes"])
+def test_the_change_heading_is_matched_in_the_forms_tickets_use(title):
+    ticket = description(heading(2, title), para("Edit .claude/settings.json."))
+    assert refusal(["EXA: Delegated"], ticket) is not None
+
+
+def test_a_description_with_no_change_heading_is_not_read():
+    ticket = description(para("Edit .claude/settings.json."))
+    assert refusal(["EXA: Delegated"], ticket) is None
+
+
+def test_naming_the_key_again_below_the_dispatch_line_is_the_opt_out():
+    """The Bar's opt-out. PPA-1758's own Change section describes this check and
+    names the file, so a re-dispatch of it needs a way past."""
+    assert refusal(["EXA: Delegated"], EDITS_SETTINGS,
+                   prompt="PPA-9\n\nPPA-9 describes the check, it does not edit "
+                          "the file.") is None
+
+
+def test_the_refusal_and_a_bar_failure_are_reported_together():
+    fields = bar_ready(["EXA: Delegated"], EDITS_SETTINGS)
+    fields["dod"] = ""
+
+    message = REAL.check_quality_bar("PPA-9", ["PPA-9"], shared={"PPA-9": fields})[0]
+
+    assert "missing a non-empty Definition of Done" in message
+    assert f"PPA-9 {ROUTE}" in message
+
+
+def test_the_description_rides_out_of_the_one_shared_read(monkeypatch):
+    """PPA-1465's rule holds: the unflattened description costs no second call."""
+    seen = []
+
+    def get(path, timeout=None):
+        seen.append(path)
+        return {"issues": [{"key": "PPA-9", "fields": {
+            "status": {"name": "To Do"},
+            "components": [{"name": "EXA: Delegated"}],
+            "description": EDITS_SETTINGS, "customfield_10767": adf("x")}}]}
+
+    monkeypatch.setattr(REAL, "_jira_get", get)
+    fields = REAL.dispatched_fields(["PPA-9"])["PPA-9"]
+
+    assert len(seen) == 1
+    assert fields["description_adf"] == EDITS_SETTINGS
+    assert REAL.edits_repo_settings(fields) is True

@@ -350,6 +350,21 @@ refusing before the work starts.
 defensible where the check itself only reports: a 42-ticket sweep returned
 seven flags and one real finding before the detection was fixed, and one after.
 
+A settings-file edit is not Delegated work — PPA-1758
+------------------------------------------------------
+Claude Code's permission check refuses a session's edit to its own repository's
+``.claude/settings.json`` with the reason "Self-Modification", and the session
+correctly stops. It blocked PPA-1744 and PPA-1745 on 30-SEP-2026. Ruling 1A,
+01-OCT-2026: a ticket that edits that file is worked Guided. This check refuses
+a Delegated ticket whose Change section names it, before a session spends a run
+finding out.
+
+The Change section is read from the description's own headings, so a ticket
+that lists the file as untouched under its scope boundary is not a match, and
+neither is ``~/.claude/settings.json``, the Mac's user settings. The refusal
+shares the Bar's opt-out: naming the key again in prose lets it through, which
+a ticket whose Change section describes this very check needs.
+
 Deployed skills drift, and the session binds one copy — PPA-1470
 -----------------------------------------------------------------
 Amendment 2, as corrected by the conductor on 16-SEP-2026. A dispatch is only
@@ -638,6 +653,9 @@ def dispatched_fields(keys, timeout=JIRA_TIMEOUT):
             # item reports per condition and the flattened string above has
             # lost the boundaries between them; no second Jira call is made.
             "dod_adf": fields.get("customfield_10767"),
+            # The description unflattened, since PPA-1758: the Change section
+            # is found by its heading, which flattening loses.
+            "description_adf": fields.get("description"),
         }
     return found
 
@@ -1223,6 +1241,69 @@ def bar_block_message(failures):
     )
 
 
+#: PPA-1758. The repository's own settings file; the home-folder copy is the
+#: Mac's user settings and is told apart by what stands in front of the match.
+_SETTINGS_RE = re.compile(r"([^\s`'\"(]*)\.claude/settings\.json")
+_HOME_PREFIXES = ("~/", "$HOME/", "${HOME}/", "/Users/", "/home/")
+_CHANGE_HEADING_RE = re.compile(r"^(the )?changes?\b")
+
+#: What the refusal says after the key: the file and the route.
+SETTINGS_ROUTE = (
+    "edits .claude/settings.json - work this ticket Guided: chat writes a Run "
+    "Terminal script, the operator runs it (Decision 1A, 01-OCT-2026)")
+
+
+# Dropped (PPA-1758): ``--dispatch-set`` does not run the settings check, so it
+# lists a Delegated ticket that edits the file as PASS. What breaks if it is
+# never fixed: a dispatch composed from that listing is refused once, with the
+# Guided route in the message, and costs one prompt.
+
+
+def change_section(description):
+    """The text under the description's Change heading, from its ADF.
+
+    The section runs to the next heading of the same or a higher level. A
+    description with no such heading has no Change section, and nothing in it
+    is read: a ticket cannot be told to edit the file by a section it lacks.
+    """
+    text, level = [], None
+    for node in (description or {}).get("content") or []:
+        if node.get("type") == "heading":
+            depth = (node.get("attrs") or {}).get("level", 1)
+            if level is not None and depth <= level:
+                break
+            title = " ".join(flatten_adf(node)).strip().lower()
+            if level is None and _CHANGE_HEADING_RE.match(title):
+                level = depth
+        elif level is not None:
+            flatten_adf(node, text)
+    return " ".join(text)
+
+
+def edits_repo_settings(fields):
+    """True for a Delegated ticket whose Change section names a repository's
+    ``.claude/settings.json``. A Guided ticket is never a match."""
+    if work_type_of(fields["components"]) != "Delegated":
+        return False
+    return any(not match.group(1).startswith(_HOME_PREFIXES)
+               for match in _SETTINGS_RE.finditer(
+                   change_section(fields.get("description_adf"))))
+
+
+def settings_block_message(keys):
+    lines = "\n".join(f"  {key} {SETTINGS_ROUTE}" for key in keys)
+    return (
+        "Dispatch carries a Delegated ticket that Claude Code's permission "
+        "check will refuse.\n\n"
+        f"{lines}\n\n"
+        "The check refuses a session's edit to its own repository's "
+        ".claude/settings.json (reason \"Self-Modification\"), so the session "
+        "would stop and ship nothing. Move the ticket to Guided, or name the key "
+        "again in the prompt text below the dispatch line - a second mention is "
+        "the opt-out and lets this through."
+    )
+
+
 def check_quality_bar(prompt, keys, shared=None):
     """(block message or None, {key: live status}) for the dispatched keys.
 
@@ -1251,12 +1332,22 @@ def check_quality_bar(prompt, keys, shared=None):
         if missing:
             failures[key] = missing
 
+    guarded = [key for key in keys
+               if key not in waived and key in fields
+               and edits_repo_settings(fields[key])]
+
     statuses = {k: v["status"] for k, v in fields.items()}
-    if not failures:
+    if not failures and not guarded:
         return None, statuses
 
-    log("bar-failed", list(failures), failures=failures)
-    return bar_block_message(failures), statuses
+    messages = []
+    if failures:
+        log("bar-failed", list(failures), failures=failures)
+        messages.append(bar_block_message(failures))
+    if guarded:
+        log("settings-edit-refused", guarded)
+        messages.append(settings_block_message(guarded))
+    return "\n\n".join(messages), statuses
 
 
 # --------------------------------------------------------------------------
