@@ -75,6 +75,15 @@
             "statusMessage": "Grading this session's Definition of Done conditions..."
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "r=\"${CLAUDE_PLUGIN_ROOT:-}\"; if [ -z \"$r\" ]; then r=$(ls -dt \"$HOME\"/.claude/plugins/cache/peech-ci/pt-automation-hooks/*/ 2>/dev/null | head -1); r=\"${r%/}\"; fi; h=\"$r/hooks/log_turn_worklog.py\"; [ ! -f \"$h\" ] && exit 0; exec python3 \"$h\"",
+            "timeout": 30
+          }
+        ]
       }
     ],
     "SessionEnd": [

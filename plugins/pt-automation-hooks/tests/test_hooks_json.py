@@ -5,7 +5,8 @@ PPA-1586. The set is every hook wired in two or more repositories'
 by name. A hook file in hooks/ that nothing registers never runs, and a
 registration naming a file that is not there fails on every firing, so both
 directions are asserted. PPA-1597 added label_spawned_ticket.py, and PPA-1626
-deny_push_without_checklist.py, and PPA-1662 refresh_ci_workflows.py.
+deny_push_without_checklist.py, and PPA-1662 refresh_ci_workflows.py. PPA-1757
+added log_turn_worklog.py, the one Stop hook that fails open.
 """
 
 import json
@@ -21,7 +22,8 @@ EXPECTED = {
     "PreToolUse": [("mcp__atlassian-rovo__createJiraIssue", "deny_in_scope_spawn.py"),
                    ("Bash", "deny_push_without_checklist.py")],
     "PostToolUse": [("mcp__atlassian-rovo__createJiraIssue", "label_spawned_ticket.py")],
-    "Stop": [(None, "check_claudemd.py"), (None, "grade_definition_of_done.py")],
+    "Stop": [(None, "check_claudemd.py"), (None, "grade_definition_of_done.py"),
+             (None, "log_turn_worklog.py")],
     "SessionEnd": [(None, "arm_auto_merge.py")],
 }
 
@@ -49,3 +51,22 @@ def test_every_command_resolves_the_plugin_root_the_same_way():
         for block in blocks:
             for hook in block["hooks"]:
                 assert hook["command"].startswith('r="${CLAUDE_PLUGIN_ROOT:-}"; ')
+
+
+def _stop_hooks():
+    return {name: hook for block in CONFIG["hooks"]["Stop"] for hook in block["hooks"]
+            for name in re.findall(r"hooks/(\w+\.py)", hook["command"])}
+
+
+def test_the_worklog_hook_fails_open_with_a_timeout():
+    """PPA-1757. Exit 2 blocks the stop, so a missing file must exit 0."""
+    hook = _stop_hooks()["log_turn_worklog.py"]
+    assert '[ ! -f "$h" ] && exit 0' in hook["command"]
+    assert "exit 2" not in hook["command"]
+    assert hook["timeout"] > 0
+
+
+def test_the_existing_stop_hooks_still_fail_closed():
+    hooks = _stop_hooks()
+    for name in ("check_claudemd.py", "grade_definition_of_done.py"):
+        assert "exit 2" in hooks[name]["command"]
