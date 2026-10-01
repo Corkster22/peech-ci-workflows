@@ -18,10 +18,12 @@ What it does, in order
 4. Posts only when the Jira identity in the credentials file is Sean's.
 5. Splits each turn evenly across its keys, remainder seconds to the first, so
    the parts sum to the turn. A key's part counts as posted when its tag is in
-   a worklog description on that key's issue. A part of a minute or more posts
-   as its own worklog with ``billableSeconds`` 0. A shorter part is held, never
-   rounded up, because Tempo refuses under 60 seconds, and a key's held parts
-   post as one worklog, carrying every tag it covers, once they reach 60.
+   a worklog description on that key's issue. Each part not yet posted posts as
+   its own worklog with ``billableSeconds`` 0. Tempo refuses a worklog under 60
+   seconds, so a part under a minute is rounded up to exactly 60 on purpose,
+   by Sean's ruling (Decision 1B, Amendment 3), overstating it by at most 59
+   seconds. A longer part posts at its real length. Nothing is held across
+   turns and no worklog bundles several turns.
 
 Why every row, not the latest
 -----------------------------
@@ -34,13 +36,11 @@ every row not yet tagged in Tempo catches up on the next Stop.
 
 The residual: a session's final turn posts only when a later Stop in that
 session finds its row, or when PPA-1756's catch-up script is re-run. Nothing
-fires after the last Stop, so without one of those that turn goes unposted. The
-same holds for a key's held remainder under a minute when a session ends.
+fires after the last Stop, so without one of those that turn goes unposted.
 
 The tag is ``cc-turn:<session_id>:<uuid of the turn_duration row>``, carried as
-the whole description of a worklog for one turn, and space-separated with its
-fellows in a worklog for held parts. PPA-1756's catch-up writes the same tag,
-so a part either one posted is never posted by the other. ``CUTOFF`` keeps turns that
+the whole description. PPA-1756's catch-up writes the same tag, so a part
+either one posted is never posted by the other. ``CUTOFF`` keeps turns that
 the untagged 23-SEP backfill already covered from posting twice.
 
 Fail open
@@ -81,7 +81,8 @@ TEMPO = "https://api.tempo.io/4"
 ET = ZoneInfo("America/New_York")
 #: A turn ending before this was covered by the untagged 23-SEP backfill.
 CUTOFF = datetime(2026, 9, 24, tzinfo=ET)
-#: Tempo refuses a worklog under one minute with HTTP 400 (Amendment 2).
+#: Tempo refuses a worklog under one minute with HTTP 400, so a shorter part is
+#: rounded up to this (Amendment 3, Decision 1B).
 MIN_SECONDS = 60
 HTTP_TIMEOUT = 5
 #: Seconds this file spends on HTTP before it gives up. hooks.json allows more.
@@ -264,51 +265,50 @@ class Poster:
             self.descriptions[issue] = found
         return any(turn_tag in d for d in self.descriptions[issue])
 
-    def post(self, issue, parts):
-        """One worklog for ``parts``: their total, every tag they cover, and
-        the start of the first."""
-        row = parts[0][2]
+    def post(self, issue, part):
+        """One worklog for one part: a part under a minute rounded up to
+        exactly 60 seconds, a longer part at its real length."""
+        turn_tag, seconds, row = part
         start = (ended(row) - timedelta(milliseconds=row["durationMs"])).astimezone(ET)
         http_json("POST", f"{TEMPO}/worklogs", self.tempo, {
             "issueId": issue, "authorAccountId": SEAN,
             "startDate": start.strftime("%Y-%m-%d"), "startTime": start.strftime("%H:%M:%S"),
-            "timeSpentSeconds": sum(seconds for _, seconds, _ in parts),
-            "billableSeconds": 0,
-            "description": " ".join(turn_tag for turn_tag, _, _ in parts)})
+            "timeSpentSeconds": max(seconds, MIN_SECONDS), "billableSeconds": 0,
+            "description": turn_tag})
 
     def post_key(self, key, parts):
-        """Post this key's parts that are not yet in Tempo, or hold them.
+        """Post this key's parts whose tag is not yet on its issue in Tempo.
 
-        A part of a minute or more posts as its own worklog. Tempo refuses
-        anything under 60 seconds, so a shorter part is held, never rounded up,
-        and the held parts post as one worklog once they reach 60 seconds
-        (Amendment 2). Whether a part is posted is read per tag and per issue,
-        so a later Stop finishes a multi-key turn that stopped partway.
+        Tempo refuses a worklog under 60 seconds, so a part under a minute
+        posts as 60 seconds, rounded up on purpose (Sean's ruling, Decision 1B,
+        Amendment 3): conductor time is not captured at all, so the timesheet
+        already runs short, and a small overage moves the total toward true.
+        Each post can overstate its part by at most 59 seconds. No other
+        rounding is done, a part of 60 seconds or more posts at its real
+        length, and a part of zero seconds posts nothing, which keeps the
+        59-second bound. Nothing is held across turns and no worklog bundles
+        several turns, so a later Stop posts only what Tempo does not yet show.
 
-        The residual: a key's held remainder under 60 seconds when a session
-        ends is never posted, because nothing fires after the last Stop, and a
-        multi-key turn left partway at that point stays partway.
-
-        PPA-1757 considered and dropped: bundling the parts of a minute or more
-        too, so that one Stop posts one worklog per key. Amendment 2 holds only
-        a part under 60 seconds, and PPA-1756 posts one worklog per key under
-        one tag, so this keeps to that. A bundle would change how many worklogs
-        a day carries, never the day's total, so nothing observable breaks if
-        it is never done.
+        Whether a part is posted is read per tag and per issue (Amendment 2
+        rule 3), so a later Stop finishes a multi-key turn that stopped
+        partway. The residual: with no later Stop, a multi-key turn left
+        partway at the end of a session stays partway.
         """
         issue = self.issue_id(key)
-        unposted = [part for part in parts if not self.posted(issue, part[0])]
-        for part in (p for p in unposted if p[1] >= MIN_SECONDS):
-            self.post(issue, [part])
-        held = [p for p in unposted if p[1] < MIN_SECONDS]
-        if sum(seconds for _, seconds, _ in held) >= MIN_SECONDS:
-            self.post(issue, held)
+        for part in parts:
+            if not self.posted(issue, part[0]):
+                self.post(issue, part)
 
 
 def parts_by_key(session_id, todo):
     """Each key's (tag, seconds, row) parts of the turns it was dispatched on."""
     by_key = {}
     for row, keys in todo:
+        # PPA-1757 considered and dropped: Amendment 3 says "no other rounding",
+        # yet milliseconds become whole seconds here, half up, because Tempo's
+        # timeSpentSeconds is an integer and the remainder-to-first split needs
+        # one. It moves a turn by under half a second and predates Amendment 3,
+        # so nothing observable breaks if it is never changed.
         total = (row["durationMs"] + 500) // 1000
         for key, seconds in zip(keys, split_seconds(total, len(keys))):
             if seconds > 0:

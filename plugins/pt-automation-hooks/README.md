@@ -20,13 +20,14 @@ nothing.
   session finds its row, or when PPA-1756's script is re-run.
 - Several keys in the dispatch split the turn evenly. The first key takes the
   remainder seconds.
-- Tempo refuses a worklog under one minute, so a key's part under 60 seconds is
-  held, never rounded up. A key's held parts post as one worklog once they
-  reach 60 seconds, and a key's held remainder under 60 seconds when a session
-  ends is never posted.
+- Tempo refuses a worklog under one minute, so a part under 60 seconds posts as
+  exactly 60 seconds. This is deliberate (Sean's ruling, Decision 1B): conductor
+  time is not captured at all, so the timesheet already runs short, and each
+  post can overstate its part by at most 59 seconds. A part of 60 seconds or
+  more posts at its real length. Nothing is held across turns, and no worklog
+  bundles several turns.
 - Each worklog carries `billableSeconds` 0 and the tag
   `cc-turn:<session_id>:<uuid of the turn_duration row>` as its description. A
-  worklog for held parts carries every tag it covers, separated by spaces. A
   part counts as posted when its tag is in a worklog description on that key's
   issue, so a later Stop finishes a multi-key turn that stopped partway.
   PPA-1756's catch-up writes the same tag.
