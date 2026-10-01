@@ -149,6 +149,60 @@ def test_dispatch_keys(text, keys):
     assert hook.dispatch_keys(text) == keys
 
 
+# Amendment 1 (01-OCT-2026, corrected 12:54 ET to match PPA-1756's a069ce3e):
+# a key line may carry a note after a dash or a colon, and only those. Found
+# by the PPA-1756 dry run, session 5f321b58, which opened with
+# "PEECHPMO-491 - includes Amendment 1, comment 30603" and lost 1.2 h.
+
+
+@pytest.mark.parametrize("text, keys", [
+    ("PEECHPMO-491 - includes Amendment 1, comment 30603", ["PEECHPMO-491"]),
+    ("PPA-1757 - log turns", ["PPA-1757"]),
+    ("PPA-1, PPA-2 - both", ["PPA-1", "PPA-2"]),
+    ("PPA-1 PPA-2 - both", ["PPA-1", "PPA-2"]),
+    ("PPA-1 - see PPA-9", ["PPA-1"]),
+    ("Execute PPA-1757 - the amendment", ["PPA-1757"]),
+])
+def test_a_key_dash_note_line_is_a_dispatch(text, keys):
+    assert hook.dispatch_keys(text) == keys
+
+
+@pytest.mark.parametrize("text, keys", [
+    ("PEECHPMO-491: includes Amendment 1, comment 30603", ["PEECHPMO-491"]),
+    ("PPA-1757: log turns", ["PPA-1757"]),
+    ("PPA-1 : spaced colon", ["PPA-1"]),
+    ("PPA-1, PPA-2: both", ["PPA-1", "PPA-2"]),
+])
+def test_a_key_colon_note_line_is_a_dispatch(text, keys):
+    assert hook.dispatch_keys(text) == keys
+
+
+@pytest.mark.parametrize("text", [
+    "PPA-1700 is failing, why?",
+    "PPA-1, PPA-2 is failing",
+    "PPA-1700 why",
+    "PPA-1289. Fetch the ticket for the spec.",
+    "Please look at PEECHPMO-491 - it fails",
+    "Some prose\nPEECHPMO-491 - note on a later line",
+    # A comma is not a note separator (the 12:54 ET correction).
+    "PPA-1757, run the fix",
+    "PPA-1757, PPA-1756, why is this failing?",
+])
+def test_a_key_followed_by_a_word_is_not_a_dispatch(text):
+    assert hook.dispatch_keys(text) == []
+
+
+def test_a_key_dash_note_dispatch_posts_on_its_key(run):
+    """End to end: the session-5f321b58 opening line now maps its turn."""
+    _, router, _ = run([prompt("PEECHPMO-491 - includes Amendment 1, comment 30603"), TURN])
+    assert [p["issueId"] for p in router.posts] == [45491]
+
+
+def test_a_prose_line_naming_a_key_posts_nothing(run):
+    code, router, lines = run([prompt("PPA-1700 is failing, why?"), TURN])
+    assert (code, router.calls, lines) == (0, [], [])
+
+
 def test_the_latest_dispatch_holds_until_the_next(tmp_path):
     path = tmp_path / "t.jsonl"
     rows = [prompt("PPA-1"), turn(uuid="a"), prompt("a question about PPA-9"),

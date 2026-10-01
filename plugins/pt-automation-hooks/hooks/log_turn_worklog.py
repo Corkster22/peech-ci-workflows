@@ -12,8 +12,9 @@ What it does, in order
    after ``CUTOFF``. None - a headless or SDK session, or a slash command -
    means nothing to post.
 3. Maps each turn to the keys of the latest dispatch line before it: a first
-   non-blank line holding only keys, the older "Execute PPA-XXX." form, or the
-   same line beneath a ``<pasted_content>`` tag. A turn with no key is skipped.
+   non-blank line opening with keys, then nothing or a ``-`` or ``:`` and a
+   note (Amendment 1), the older "Execute PPA-XXX." form, or the same line
+   beneath a ``<pasted_content>`` tag. A turn with no key is skipped.
 4. Posts only when the Jira identity in the credentials file is Sean's.
 5. Skips each turn whose tag is already in Sean's Tempo worklogs for its date.
    Splits each other turn evenly across its keys, remainder seconds to the
@@ -81,10 +82,15 @@ DEADLINE = 25
 #: Tempo pages a user's worklogs; a day is never near this many pages.
 MAX_PAGES = 10
 
-_KEY_RE = re.compile(r"\b(?:PPA|PEECHPMO)-\d+\b", re.IGNORECASE)
+_KEY = r"(?:PPA|PEECHPMO)-\d+\b"
+_KEY_RE = re.compile(_KEY, re.IGNORECASE)
+#: The keys a line opens with, after an optional "Execute".
+_LEAD_RE = re.compile(rf"^\s*(?:execute\s+)?({_KEY}(?:[ ,;&/\t]+{_KEY})*)", re.IGNORECASE)
 _PASTE_TAG_RE = re.compile(r"</?pasted_content[^>]*>")
-_EXECUTE_RE = re.compile(r"^\s*execute\b", re.IGNORECASE)
 _SEPARATORS = " ,;:.&/\t"
+#: What may follow the keys before a note: a dash or a colon, then any text. A
+#: comma is not one (Amendment 1, corrected 01-OCT-2026 12:54 ET).
+_NOTE_LEADS = ("-", ":")
 
 _started = time.monotonic()
 
@@ -115,18 +121,26 @@ def dispatch_keys(prompt):
     """The keys a prompt dispatches, or [] where it dispatches none.
 
     Only the first non-blank line counts, after any pasted_content tag is
-    removed, and only when it holds nothing but keys, separators and an
-    optional leading "Execute". Prose that merely starts with a key is not a
-    dispatch (PPA-1676 Q5).
+    removed. It dispatches when it opens with one or more keys (an optional
+    leading "Execute" is allowed) and the rest is nothing but punctuation, or a
+    dash or a colon and then any text, so ``PEECHPMO-491 - includes Amendment
+    1`` and ``PPA-1757: log turns`` dispatch (PPA-1757 Amendment 1, the rule
+    PPA-1756 shipped in a069ce3e). A key followed directly by a word, as in
+    ``PPA-1700 is failing, why?``, is prose, and so are a comma note such as
+    ``PPA-1757, run the fix`` and a key sentence such as ``PPA-1289. Fetch the
+    ticket`` (PPA-1676 Q5). Only the leading keys dispatch, never a key inside
+    the note, and a note on a later line does not count.
     """
     for line in _PASTE_TAG_RE.sub("", prompt).splitlines():
         line = line.strip()
         if not line:
             continue
-        keys = _KEY_RE.findall(line)
-        residue = _EXECUTE_RE.sub("", _KEY_RE.sub("", line))
-        if keys and not residue.strip(_SEPARATORS):
-            return list(dict.fromkeys(k.upper() for k in keys))
+        lead = _LEAD_RE.match(line)
+        if lead:
+            tail = line[lead.end():]
+            if not tail.strip(_SEPARATORS) or tail.lstrip().startswith(_NOTE_LEADS):
+                return list(dict.fromkeys(
+                    k.upper() for k in _KEY_RE.findall(lead.group(1))))
         return []
     return []
 
