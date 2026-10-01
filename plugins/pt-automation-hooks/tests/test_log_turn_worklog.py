@@ -269,11 +269,6 @@ def test_several_keys_split_the_turn_and_sum_to_it(run):
     assert {p["description"] for p in router.posts} == {TAG}
 
 
-def test_a_key_with_no_seconds_left_is_not_posted(run):
-    code, router, lines = run([prompt("PPA-1, PPA-2, PPA-3"), turn(durationMs=2000)])
-    assert (code, router.posts, lines) == (0, [], [])
-
-
 def test_the_start_date_is_the_start_in_eastern_time(run):
     """Starts 00:00 UTC on the 25th, which is 20:00 EDT on the 24th."""
     _, router, _ = run([prompt("PPA-1"), turn(
@@ -385,68 +380,83 @@ def test_a_network_failure_stops_the_run_with_one_log_line(run):
     _one_line(lines, turn_name=f"cc-turn:{SESSION}:a", reason="TimeoutError")
 
 
-# --- Amendment 2: Tempo's one-minute floor ----------------------------------
+# --- Amendments 2 and 3: Tempo's one-minute floor ---------------------------
 #
 # Found live by PPA-1756 on 01-OCT-2026: Tempo rejects any worklog under 60 s
-# with HTTP 400 "Duration must be at least one minute". A key's part under a
-# minute is held, never rounded up, and posts with the other held parts once
-# they reach 60 s, carrying every tag it covers.
+# with HTTP 400 "Duration must be at least one minute". Amendment 3 (Decision
+# 1B) rounds a part under a minute up to exactly 60 s, posts a longer part at
+# its real length, and holds and bundles nothing. The per-tag, per-issue posted
+# check of Amendment 2 stays.
 
 
 def secs(uuid, seconds, end="2026-09-30T14:00:00.000Z"):
     return turn(uuid=uuid, durationMs=seconds * 1000, timestamp=end)
 
 
-def tags(*uuids):
-    return " ".join(f"cc-turn:{SESSION}:{u}" for u in uuids)
-
-
-@pytest.mark.parametrize("seconds, posted", [(59, False), (60, True), (1, False), (61, True)])
-def test_a_part_under_a_minute_is_held_and_one_at_a_minute_posts(run, seconds, posted):
-    code, router, lines = run([prompt("PPA-1"), secs("a", seconds)])
+@pytest.mark.parametrize("real, posted", [
+    (1, 60), (30, 60), (59, 60), (60, 60), (61, 61), (120, 120), (485, 485)])
+def test_a_part_under_a_minute_posts_sixty_seconds_and_a_longer_one_its_real_length(
+        run, real, posted):
+    code, router, lines = run([prompt("PPA-1"), secs("a", real)])
     assert (code, lines) == (0, [])
-    assert [p["timeSpentSeconds"] for p in router.posts] == ([seconds] if posted else [])
+    assert [p["timeSpentSeconds"] for p in router.posts] == [posted]
 
 
-def test_a_split_part_under_a_minute_is_held_while_the_others_post(run):
-    """150 s over two keys is 75 and 75; 100 s over three is 34, 33, 33."""
+def test_a_multi_key_turn_with_parts_under_a_minute_posts_sixty_seconds_per_key(run):
+    """100 s over three keys is 34, 33 and 33."""
+    _, router, _ = run([prompt("PPA-1, PPA-2, PPA-3"), secs("a", 100)])
+    assert [(p["issueId"], p["timeSpentSeconds"]) for p in router.posts] == [
+        (45001, 60), (45002, 60), (45003, 60)]
+
+
+def test_a_multi_key_turn_with_parts_over_a_minute_posts_their_real_lengths(run):
+    """150 s over two keys is 75 and 75."""
     _, router, _ = run([prompt("PPA-1, PPA-2"), secs("a", 150)])
     assert [p["timeSpentSeconds"] for p in router.posts] == [75, 75]
-    _, router, _ = run([prompt("PPA-1, PPA-2, PPA-3"), secs("a", 100)])
-    assert router.posts == []
 
 
-def test_held_parts_post_together_once_they_reach_a_minute(run):
-    x = secs("x", 30, "2026-09-30T14:00:30.000Z")
-    y = secs("y", 40, "2026-09-30T15:00:40.000Z")
-    _, router, lines = run([prompt("PPA-1"), x, y])
-    assert lines == []
-    assert router.posts == [{
-        "issueId": 45001, "authorAccountId": hook.SEAN, "startDate": "2026-09-30",
-        "startTime": "10:00:00", "timeSpentSeconds": 70, "billableSeconds": 0,
-        "description": tags("x", "y")}]
+def test_a_zero_second_part_posts_nothing(run):
+    """2 s over three keys is 2, 0 and 0. A zero part would overstate by 60 s,
+    past the 59 s Decision 1B allows, so only the first key posts."""
+    _, router, _ = run([prompt("PPA-1, PPA-2, PPA-3"), secs("a", 2)])
+    assert [(p["issueId"], p["timeSpentSeconds"]) for p in router.posts] == [(45001, 60)]
 
 
-def test_held_parts_that_stay_under_a_minute_never_post(run):
-    """The residual: a held remainder under a minute at session end is lost."""
-    code, router, lines = run([prompt("PPA-1"), secs("a", 20), secs("b", 25)])
+def test_a_turn_that_rounds_to_zero_seconds_posts_nothing(run):
+    code, router, lines = run([prompt("PPA-1"), turn(durationMs=400)])
     assert (code, router.posts, lines) == (0, [], [])
 
 
-def test_a_whole_part_posts_alone_and_the_held_parts_post_as_one(run):
-    rows = [prompt("PPA-1"), secs("a", 120), secs("b", 20), secs("c", 50)]
+def test_every_slice_posts_on_its_own_and_nothing_is_held_or_bundled(run):
+    """Four short turns on one key: four worklogs of 60 s, one tag each, so no
+    slice waits for a later Stop and no worklog carries several turns."""
+    rows = [prompt("PPA-1")] + [secs(u, 20) for u in "abcd"]
     _, router, _ = run(rows)
     assert [(p["timeSpentSeconds"], p["description"]) for p in router.posts] == [
-        (120, tags("a")), (70, tags("b", "c"))]
+        (60, f"cc-turn:{SESSION}:{u}") for u in "abcd"]
 
 
-def test_a_held_part_is_picked_up_by_a_later_stop(run):
-    """Stop 1 sees 30 s and holds it; stop 2 sees 30 s more and posts both."""
-    _, router, _ = run([prompt("PPA-1"), secs("a", 30)])
-    assert router.posts == []
-    _, router, _ = run([prompt("PPA-1"), secs("a", 30), secs("b", 30)])
-    assert [(p["timeSpentSeconds"], p["description"]) for p in router.posts] == [
-        (60, tags("a", "b"))]
+def test_a_later_stop_posts_only_the_slices_not_yet_in_tempo(run):
+    router = Router(existing=[f"cc-turn:{SESSION}:a"])
+    _, router, _ = run([prompt("PPA-1"), secs("a", 20), secs("b", 20)], router=router)
+    assert [p["description"] for p in router.posts] == [f"cc-turn:{SESSION}:b"]
+
+
+def test_no_post_is_under_a_minute_or_overstates_a_part_by_more_than_59_seconds(run):
+    """Two keys over mixed turns: each post is max(part, 60), its tag is on
+    the issue once, and it overstates its part by at most 59 seconds."""
+    durations = [95, 10, 61, 7, 200, 3, 59, 1, 121]
+    rows = [prompt("PPA-1, PPA-2")] + [secs(f"u{i}", d) for i, d in enumerate(durations)]
+    _, router, _ = run(rows)
+    for index, issue in enumerate((45001, 45002)):
+        parts = [x for x in (hook.split_seconds(d, 2)[index] for d in durations) if x > 0]
+        mine = [p for p in router.posts if p["issueId"] == issue]
+        assert len(mine) == len(parts)
+        for post, part in zip(mine, parts):
+            assert post["timeSpentSeconds"] == max(part, 60)
+            assert post["timeSpentSeconds"] - part <= 59
+        tags = [p["description"] for p in mine]
+        assert len(tags) == len(set(tags)) and all(" " not in t for t in tags)
 
 
 def test_a_posted_check_is_per_tag_and_per_issue(run):
@@ -461,30 +471,6 @@ def test_a_tag_on_another_issue_does_not_count_as_posted(run):
     router = Router(by_issue={45002: [TAG]})
     _, router, _ = run([prompt("PPA-1, PPA-2"), TURN], router=router)
     assert [p["issueId"] for p in router.posts] == [45001]
-
-
-def test_a_bundle_worklog_counts_every_tag_it_carries_as_posted(run):
-    router = Router(by_issue={45001: [tags("x", "y")]})
-    code, router, lines = run([prompt("PPA-1"), secs("x", 30), secs("y", 40)], router=router)
-    assert (code, router.posts, lines) == (0, [], [])
-
-
-def test_no_post_carries_under_a_minute_or_more_than_its_turns(run):
-    """Two keys over mixed turns: every post is at least 60 s, no tag posts twice
-    on one issue, and an issue's posts sum to its whole parts plus its held parts
-    when those reach a minute."""
-    durations = [95, 10, 61, 7, 200, 3, 59, 1, 121]
-    rows = [prompt("PPA-1, PPA-2")] + [secs(f"u{i}", d) for i, d in enumerate(durations)]
-    _, router, _ = run(rows)
-    assert router.posts and all(p["timeSpentSeconds"] >= 60 for p in router.posts)
-    for index, issue in enumerate((45001, 45002)):
-        parts = [hook.split_seconds(d, 2)[index] for d in durations]
-        whole = sum(s for s in parts if s >= 60)
-        held = sum(s for s in parts if 0 < s < 60)
-        mine = [p for p in router.posts if p["issueId"] == issue]
-        assert sum(p["timeSpentSeconds"] for p in mine) == whole + (held if held >= 60 else 0)
-        seen = [t for p in mine for t in p["description"].split()]
-        assert len(seen) == len(set(seen))
 
 
 # --- every failure path exits 0 and writes one log line ---------------------
