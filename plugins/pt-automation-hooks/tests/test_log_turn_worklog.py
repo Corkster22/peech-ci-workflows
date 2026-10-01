@@ -48,10 +48,11 @@ def turn(**fields):
 class Router:
     """Stands in for http_json and records every request."""
 
-    def __init__(self, *, account=hook.SEAN, existing=(), fail=None, fail_post=None,
-                 missing=None):
+    def __init__(self, *, account=hook.SEAN, existing=(), by_issue=None, fail=None,
+                 fail_post=None, missing=None):
+        """``existing`` descriptions sit on every issue, ``by_issue`` on one."""
         self.account, self.existing, self.fail = account, list(existing), fail
-        self.fail_post, self.missing = fail_post, missing
+        self.by_issue, self.fail_post, self.missing = by_issue or {}, fail_post, missing
         self.calls = []
 
     def __call__(self, method, url, headers, body=None):
@@ -60,12 +61,14 @@ class Router:
             raise self.fail or self.fail_post
         if url.endswith("/myself"):
             return {"accountId": self.account}
+        tempo = re.search(r"/worklogs/issue/(\d+)", url)
+        if tempo:
+            found = self.existing + self.by_issue.get(int(tempo.group(1)), [])
+            return {"results": [{"description": d} for d in found], "metadata": {}}
         if self.missing and f"/issue/{self.missing}?" in url:
             raise RuntimeError(f"GET {url} -> HTTP 404")
         if "/issue/" in url:
             return {"id": str(45000 + int(re.search(r"-(\d+)\?", url).group(1)))}
-        if method == "GET":
-            return {"results": [{"description": d} for d in self.existing], "metadata": {}}
         return {}
 
     @property
@@ -260,15 +263,15 @@ def test_the_tag_is_the_description_character_for_character(run):
 
 
 def test_several_keys_split_the_turn_and_sum_to_it(run):
-    _, router, _ = run([prompt("PPA-1, PPA-2, PPA-3"), turn(durationMs=10000)])
+    _, router, _ = run([prompt("PPA-1, PPA-2, PPA-3"), turn(durationMs=310000)])
     assert [(p["issueId"], p["timeSpentSeconds"]) for p in router.posts] == [
-        (45001, 4), (45002, 3), (45003, 3)]
+        (45001, 104), (45002, 103), (45003, 103)]
     assert {p["description"] for p in router.posts} == {TAG}
 
 
 def test_a_key_with_no_seconds_left_is_not_posted(run):
-    _, router, _ = run([prompt("PPA-1, PPA-2, PPA-3"), turn(durationMs=2000)])
-    assert [p["issueId"] for p in router.posts] == [45001]
+    code, router, lines = run([prompt("PPA-1, PPA-2, PPA-3"), turn(durationMs=2000)])
+    assert (code, router.posts, lines) == (0, [], [])
 
 
 def test_the_start_date_is_the_start_in_eastern_time(run):
@@ -298,7 +301,7 @@ def test_the_existing_tag_lookup_follows_tempo_paging(monkeypatch):
     monkeypatch.setattr(hook, "http_json",
                         lambda method, url, headers, body=None: seen.append(url) or next(pages))
     poster = hook.Poster({"JIRA_EMAIL": "e", "JIRA_API_TOKEN": "j", "TEMPO_FM_OAUTH_TOKEN": "t"})
-    assert poster.posted("2026-09-24", TAG) is True
+    assert poster.posted(45001, TAG) is True
     assert seen[1] == "https://api.tempo.io/next"
 
 
@@ -341,13 +344,12 @@ def test_a_run_with_everything_posted_makes_no_post(run):
     router = Router(existing=[f"cc-turn:{SESSION}:a", f"cc-turn:{SESSION}:b"])
     code, router, lines = run([prompt("PPA-1"), A, B], router=router)
     assert (code, router.posts, lines) == (0, [], [])
-    assert not any("/issue/" in c[1] for c in router.calls)
 
 
-def test_tempo_is_read_once_per_start_date(run):
+def test_tempo_is_read_once_per_issue_not_per_user_or_date(run):
     _, router, _ = run([prompt("PPA-1"), A, B])
-    reads = [c for c in router.calls if c[0] == "GET" and "tempo.io" in c[1]]
-    assert len(reads) == 1
+    reads = [c[1] for c in router.calls if c[0] == "GET" and "tempo.io" in c[1]]
+    assert reads == ["https://api.tempo.io/4/worklogs/issue/45001?limit=1000"]
 
 
 def test_a_row_ending_before_the_cutoff_never_posts(run):
@@ -381,6 +383,108 @@ def test_a_network_failure_stops_the_run_with_one_log_line(run):
     code, router, lines = run([prompt("PPA-1"), A, B], router=router)
     assert code == 0 and len(router.posts) == 1
     _one_line(lines, turn_name=f"cc-turn:{SESSION}:a", reason="TimeoutError")
+
+
+# --- Amendment 2: Tempo's one-minute floor ----------------------------------
+#
+# Found live by PPA-1756 on 01-OCT-2026: Tempo rejects any worklog under 60 s
+# with HTTP 400 "Duration must be at least one minute". A key's part under a
+# minute is held, never rounded up, and posts with the other held parts once
+# they reach 60 s, carrying every tag it covers.
+
+
+def secs(uuid, seconds, end="2026-09-30T14:00:00.000Z"):
+    return turn(uuid=uuid, durationMs=seconds * 1000, timestamp=end)
+
+
+def tags(*uuids):
+    return " ".join(f"cc-turn:{SESSION}:{u}" for u in uuids)
+
+
+@pytest.mark.parametrize("seconds, posted", [(59, False), (60, True), (1, False), (61, True)])
+def test_a_part_under_a_minute_is_held_and_one_at_a_minute_posts(run, seconds, posted):
+    code, router, lines = run([prompt("PPA-1"), secs("a", seconds)])
+    assert (code, lines) == (0, [])
+    assert [p["timeSpentSeconds"] for p in router.posts] == ([seconds] if posted else [])
+
+
+def test_a_split_part_under_a_minute_is_held_while_the_others_post(run):
+    """150 s over two keys is 75 and 75; 100 s over three is 34, 33, 33."""
+    _, router, _ = run([prompt("PPA-1, PPA-2"), secs("a", 150)])
+    assert [p["timeSpentSeconds"] for p in router.posts] == [75, 75]
+    _, router, _ = run([prompt("PPA-1, PPA-2, PPA-3"), secs("a", 100)])
+    assert router.posts == []
+
+
+def test_held_parts_post_together_once_they_reach_a_minute(run):
+    x = secs("x", 30, "2026-09-30T14:00:30.000Z")
+    y = secs("y", 40, "2026-09-30T15:00:40.000Z")
+    _, router, lines = run([prompt("PPA-1"), x, y])
+    assert lines == []
+    assert router.posts == [{
+        "issueId": 45001, "authorAccountId": hook.SEAN, "startDate": "2026-09-30",
+        "startTime": "10:00:00", "timeSpentSeconds": 70, "billableSeconds": 0,
+        "description": tags("x", "y")}]
+
+
+def test_held_parts_that_stay_under_a_minute_never_post(run):
+    """The residual: a held remainder under a minute at session end is lost."""
+    code, router, lines = run([prompt("PPA-1"), secs("a", 20), secs("b", 25)])
+    assert (code, router.posts, lines) == (0, [], [])
+
+
+def test_a_whole_part_posts_alone_and_the_held_parts_post_as_one(run):
+    rows = [prompt("PPA-1"), secs("a", 120), secs("b", 20), secs("c", 50)]
+    _, router, _ = run(rows)
+    assert [(p["timeSpentSeconds"], p["description"]) for p in router.posts] == [
+        (120, tags("a")), (70, tags("b", "c"))]
+
+
+def test_a_held_part_is_picked_up_by_a_later_stop(run):
+    """Stop 1 sees 30 s and holds it; stop 2 sees 30 s more and posts both."""
+    _, router, _ = run([prompt("PPA-1"), secs("a", 30)])
+    assert router.posts == []
+    _, router, _ = run([prompt("PPA-1"), secs("a", 30), secs("b", 30)])
+    assert [(p["timeSpentSeconds"], p["description"]) for p in router.posts] == [
+        (60, tags("a", "b"))]
+
+
+def test_a_posted_check_is_per_tag_and_per_issue(run):
+    """A two-key turn posted for PPA-1 only is finished for PPA-2."""
+    router = Router(by_issue={45001: [TAG]})
+    _, router, _ = run([prompt("PPA-1, PPA-2"), TURN], router=router)
+    assert [(p["issueId"], p["timeSpentSeconds"], p["description"])
+            for p in router.posts] == [(45002, 243, TAG)]
+
+
+def test_a_tag_on_another_issue_does_not_count_as_posted(run):
+    router = Router(by_issue={45002: [TAG]})
+    _, router, _ = run([prompt("PPA-1, PPA-2"), TURN], router=router)
+    assert [p["issueId"] for p in router.posts] == [45001]
+
+
+def test_a_bundle_worklog_counts_every_tag_it_carries_as_posted(run):
+    router = Router(by_issue={45001: [tags("x", "y")]})
+    code, router, lines = run([prompt("PPA-1"), secs("x", 30), secs("y", 40)], router=router)
+    assert (code, router.posts, lines) == (0, [], [])
+
+
+def test_no_post_carries_under_a_minute_or_more_than_its_turns(run):
+    """Two keys over mixed turns: every post is at least 60 s, no tag posts twice
+    on one issue, and an issue's posts sum to its whole parts plus its held parts
+    when those reach a minute."""
+    durations = [95, 10, 61, 7, 200, 3, 59, 1, 121]
+    rows = [prompt("PPA-1, PPA-2")] + [secs(f"u{i}", d) for i, d in enumerate(durations)]
+    _, router, _ = run(rows)
+    assert router.posts and all(p["timeSpentSeconds"] >= 60 for p in router.posts)
+    for index, issue in enumerate((45001, 45002)):
+        parts = [hook.split_seconds(d, 2)[index] for d in durations]
+        whole = sum(s for s in parts if s >= 60)
+        held = sum(s for s in parts if 0 < s < 60)
+        mine = [p for p in router.posts if p["issueId"] == issue]
+        assert sum(p["timeSpentSeconds"] for p in mine) == whole + (held if held >= 60 else 0)
+        seen = [t for p in mine for t in p["description"].split()]
+        assert len(seen) == len(set(seen))
 
 
 # --- every failure path exits 0 and writes one log line ---------------------
@@ -424,9 +528,10 @@ def test_a_timeout_exits_0_with_one_log_line(run):
     _one_line(lines, turn_name=TAG, reason="TimeoutError")
 
 
-def test_a_key_jira_cannot_resolve_posts_nothing_for_the_turn(run):
+def test_a_key_jira_cannot_resolve_does_not_stop_the_other_keys(run):
     code, router, lines = run([prompt("PPA-1, PPA-2"), TURN], router=Router(missing="PPA-2"))
-    assert (code, router.posts) == (0, [])
+    assert code == 0
+    assert [(p["issueId"], p["timeSpentSeconds"]) for p in router.posts] == [(45001, 243)]
     _one_line(lines, turn_name=TAG, reason="HTTP 404")
 
 

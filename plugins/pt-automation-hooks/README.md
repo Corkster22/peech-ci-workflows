@@ -20,10 +20,16 @@ nothing.
   session finds its row, or when PPA-1756's script is re-run.
 - Several keys in the dispatch split the turn evenly. The first key takes the
   remainder seconds.
+- Tempo refuses a worklog under one minute, so a key's part under 60 seconds is
+  held, never rounded up. A key's held parts post as one worklog once they
+  reach 60 seconds, and a key's held remainder under 60 seconds when a session
+  ends is never posted.
 - Each worklog carries `billableSeconds` 0 and the tag
-  `cc-turn:<session_id>:<uuid of the turn_duration row>` as its description.
-  A turn whose tag is already in Sean's Tempo worklogs for that date is
-  skipped. PPA-1756's catch-up writes the same tag.
+  `cc-turn:<session_id>:<uuid of the turn_duration row>` as its description. A
+  worklog for held parts carries every tag it covers, separated by spaces. A
+  part counts as posted when its tag is in a worklog description on that key's
+  issue, so a later Stop finishes a multi-key turn that stopped partway.
+  PPA-1756's catch-up writes the same tag.
 - Credentials are `TEMPO_FM_OAUTH_TOKEN`, `JIRA_EMAIL` and `JIRA_API_TOKEN` in
   `peech-pmo-automation/secrets/.env`.
 
@@ -33,8 +39,8 @@ Exit code 2 blocks a Stop. This hook exits 0 on every path, and its
 `hooks.json` wrapper exits 0 when the file is missing and sets a timeout.
 Each failure writes one line to `~/.claude/pt-turn-worklog-hook.log` with the
 turn, the reason and the time. Read that log to find a missed turn. A turn that
-fails part way, after one key posted and before the next, leaves its tag in
-Tempo, so it is not retried.
+fails part way, after one key posted and before the next, is finished for the
+other keys at the next Stop, because the posted check is per issue.
 
 ### Undoing a worklog
 
