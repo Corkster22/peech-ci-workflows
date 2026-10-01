@@ -231,6 +231,19 @@ issue that is not Done or Closed is outside the set. The excluded keys and
 their blockers are named in a warning: a check that quietly shrinks its own
 population is worse than one that asks too much.
 
+A ticket held until its start date is not dispatchable — PPA-1752
+------------------------------------------------------------------
+PPA-1559 was dispatched against its date hold three times: 23-SEP-2026 and
+twice on 25-SEP-2026. Ruling 1A, 30-SEP-2026: a date hold is recorded in the
+Target start field, and a ticket whose Target start is later than today is not
+dispatchable. PPA-1698 carries the batch generator half in peech-pmo-automation.
+
+A ticket whose Target start is later than today in America/New_York is outside
+the set, and is named in a warning beside the blocked keys. A ticket with no
+Target start, or one of today or earlier, is demanded as before. The field is
+found by its name in Jira's field list, never by its identifier, which Jira
+assigns per site.
+
 The set is measured by work type — PPA-1716
 --------------------------------------------
 Ruling 1A, 29-SEP-2026: a Discovery ticket (``EXA: Delegated Discovery``) runs in
@@ -423,6 +436,7 @@ import sys
 import tempfile
 import urllib.parse
 import urllib.request
+import zoneinfo
 from pathlib import Path
 
 # Path resolution for the pt-automation-hooks plugin copy (PPA-1578).
@@ -458,6 +472,11 @@ EXECUTION_COMPONENTS = ("EXA: Delegated", "EXA: Delegated Discovery")
 #: ticket carrying both is a Discovery ticket.
 WORK_TYPES = (("EXA: Delegated Discovery", "Discovery"),
               ("EXA: Delegated", "Delegated"))
+
+#: The field a date hold is recorded in (PPA-1752), found by this name in Jira's
+#: field list, and the zone "today" is read in.
+TARGET_START = "Target start"
+HOLD_ZONE = "America/New_York"
 
 #: How a Discovery dispatch is launched (Ruling 1A, 29-SEP-2026).
 DISCOVERY_LAUNCH = "claude --model opus --effort high"
@@ -857,8 +876,41 @@ def unresolved_blockers(issue):
     return out
 
 
+def target_start_field(timeout=JIRA_TIMEOUT):
+    """The identifier of the field named ``TARGET_START``, from Jira's field list.
+
+    PPA-1752. Read rather than written into the code: Jira assigns a custom
+    field's identifier per site. Raises where the read fails or no field has the
+    name, which the completeness check turns into its usual warn-and-allow.
+
+    Dropped (PPA-1752): this is a third Jira read per dispatch, beside the two
+    searches. What breaks if it is never fixed: one extra GET on the prompt that
+    starts a session, inside ``JIRA_TIMEOUT``, and nothing observable beyond
+    that. Caching the identifier across dispatches would trade it for a stale
+    one when the field is renamed or recreated.
+    """
+    data = _jira_get("/field", timeout)
+    for field in data if isinstance(data, list) else []:
+        if field.get("name") == TARGET_START:
+            return field["id"]
+    raise LookupError(f"Jira's field list has no field named {TARGET_START!r}")
+
+
+def held_until(issue, field, today):
+    """The date a ticket is held until, or None where it is dispatchable today.
+
+    A blank Target start, and one of today or earlier, hold nothing.
+    """
+    value = (issue.get("fields") or {}).get(field)
+    if not value:
+        return None
+    start = datetime.date.fromisoformat(str(value)[:10])
+    return start if start > today else None
+
+
 def dispatchable_set(component, excluded=None, unreadable=None,
-                     timeout=JIRA_TIMEOUT, work_type=None):
+                     timeout=JIRA_TIMEOUT, work_type=None, held=None,
+                     today=None):
     """Every open dispatchable key for this repository, read live from Jira.
 
     PPA-1716. ``work_type`` narrows the set to Discovery or Delegated tickets;
@@ -885,6 +937,11 @@ def dispatchable_set(component, excluded=None, unreadable=None,
     logs and warns on what came back in it, on the same footing as every other
     failure path here.
 
+    ``held`` is the same out-parameter again, PPA-1752: ``(key, date)`` for each
+    ticket whose Target start is later than ``today``, which defaults to today
+    in ``HOLD_ZONE``. A held ticket is outside the set. A ticket both blocked
+    and held is reported as blocked.
+
     Raises on any failure. The caller turns that into a warn-and-allow, which
     is the whole of this check's failure policy - see the docstring.
 
@@ -894,9 +951,12 @@ def dispatchable_set(component, excluded=None, unreadable=None,
     that client's getter takes no timeout, and a check running ahead of every
     dispatch cannot wait on a hung socket for as long as the default allows.
     """
+    start_field = target_start_field(timeout)
+    if today is None:
+        today = datetime.datetime.now(zoneinfo.ZoneInfo(HOLD_ZONE)).date()
     query = urllib.parse.urlencode(
-        {"jql": dispatchable_jql(component, work_type), "fields": "issuelinks",
-         "maxResults": 100})
+        {"jql": dispatchable_jql(component, work_type),
+         "fields": f"issuelinks,{start_field}", "maxResults": 100})
     data = _jira_get(f"/search/jql?{query}", timeout)
 
     keys = []
@@ -912,8 +972,20 @@ def dispatchable_set(component, excluded=None, unreadable=None,
             if excluded is not None:
                 excluded.append((key, blockers))
             continue
+        until = held_until(issue, start_field, today)
+        if until:
+            if held is not None:
+                held.append((key, until))
+            continue
         keys.append(key)
     return keys
+
+
+def held_warning(held):
+    """What the conductor reads when a ticket is dropped for its start date."""
+    lines = "; ".join(f"{key} (held until {until})" for key, until in held)
+    return (f"Not demanded by the completeness check, because its {TARGET_START} "
+            f"is later than today: {lines}")
 
 
 def excluded_warning(excluded):
@@ -1581,11 +1653,12 @@ def check_dispatch_complete(prompt, keys, fields=None):
 
     excluded = []
     unreadable = []
+    held = []
     work_type = next(iter(by_type), None)
     try:
         dispatchable = dispatchable_set(scope.component, excluded=excluded,
                                         unreadable=unreadable,
-                                        work_type=work_type)
+                                        work_type=work_type, held=held)
     except Exception as exc:  # noqa: BLE001 - every read failure warns and allows
         log("dispatchable-read-failed", keys, component=scope.component,
             error=repr(exc))
@@ -1610,6 +1683,13 @@ def check_dispatch_complete(prompt, keys, fields=None):
             blockers=dict(excluded))
         warn(excluded_warning(excluded))
 
+    if held:
+        # PPA-1752: named for the same reason - the set shrank by a date hold.
+        log("held-tickets-excluded", [k for k, _ in held],
+            component=scope.component,
+            until={k: str(d) for k, d in held})
+        warn(held_warning(held))
+
     missing = missing_from(dispatchable, keys_in(prompt))
     if not missing:
         return None
@@ -1633,8 +1713,9 @@ def dispatch_set_lines(repository):
     ``bar_failures`` for each key's Bar verdict. No second implementation of
     either test exists, and this adds no Jira write.
 
-    Blocked and unreadable keys are listed after the set, marked, because the
-    hook names both in its own warnings. Raises on a read failure.
+    Blocked, held (PPA-1752) and unreadable keys are listed after the set,
+    marked, because the hook names each in its own warnings. Raises on a read
+    failure.
 
     Dropped (PPA-1660): where the bundled barred-artifact check will not
     import, ``barred_artifacts`` warns through ``warn()``, which writes
@@ -1644,8 +1725,9 @@ def dispatch_set_lines(repository):
     """
     component = (repository if _REPO_COMPONENT_RE.match(repository)
                  else f"REPO: {repository}")
-    excluded, unreadable = [], []
-    keys = dispatchable_set(component, excluded=excluded, unreadable=unreadable)
+    excluded, unreadable, held = [], [], []
+    keys = dispatchable_set(component, excluded=excluded, unreadable=unreadable,
+                            held=held)
     fields = dispatched_fields(keys) if keys else {}
     lines = []
     for key in keys:
@@ -1658,6 +1740,8 @@ def dispatch_set_lines(repository):
         lines.append(f"{key}\t{fields[key]['status']}\t{kind}\t{verdict}")
     lines.extend(f"# not demanded, blocked by {', '.join(blockers)}: {key}"
                  for key, blockers in excluded)
+    lines.extend(f"# not demanded, held until {until}: {key}"
+                 for key, until in held)
     lines.extend(f"# links unreadable, still demanded: {key} ({error})"
                  for key, error in unreadable)
     return lines
