@@ -11,23 +11,38 @@ written order depends on each session remembering it, so this fires on the push.
 What it checks
 --------------
 A Bash call running ``git push`` of a ``ppa-*`` branch is denied while any key
-the session was dispatched with carries no Jira comment that yields rows
-through ``pr_merge_close_out.checklist_comments`` - ``stated_rows`` over the
-comment's ADF lines, the same read the merge grades with. The deny reason names
-each such key and the two shapes that extractor reads.
+the session was dispatched with has a Definition of Done condition that pairs
+with no stated verdict in its Jira close-out. The grade is
+``pr_merge_close_out.build_table`` - the same pairing and the same selection
+of comments the merge close-out applies (PPA-1765) - so the push is refused for
+exactly the close-out the merge would hold. A condition stated NOT MET is
+paired, and is the merge's call to hold, not this guard's. The deny reason
+names each such key, each unpaired condition's number and text, the two shapes
+the extractor reads, and that the Jira close-out comment is the thing to fix.
+
+A key whose Definition of Done is empty keeps the PPA-1626 test: at least one
+comment stating a row.
 
 Allowed without a Jira read: a branch not named ``ppa-*``, a push whose head
 commit is the session-pause ``wip:`` commit pt-session-lifecycle defines, and a
-session that dispatched nothing. Once a checklist exists every push passes, so
-a fix push after a correction is never held.
+session that dispatched nothing. A fix push after a correction passes once
+every condition pairs.
 
-It never blocks on its own outage
----------------------------------
-A Jira read that fails or runs past its budget allows the push and says so in a
-``systemMessage``, as a missing peech-ci-workflows clone does. Each read carries
-``JIRA_TIMEOUT`` and the reads together stop at ``BUDGET``, both shorter than
-the 30-second timeout hooks.json declares, so a slow Jira returns an allow
-rather than a killed hook.
+A Jira read that fails denies the push
+--------------------------------------
+Decision 1A, 01-OCT-2026: a gate that lets a push through on an error is not a
+gate. A Jira read that fails or runs past its budget denies the push and prints
+the error and the key being read. Each read carries ``JIRA_TIMEOUT`` and the
+reads together stop at ``BUDGET``, both shorter than the 30-second timeout
+hooks.json declares, so a slow Jira returns a deny rather than a killed hook.
+
+Three things still allow with a ``systemMessage``, because none is a Jira
+read: a missing peech-ci-workflows clone, an unreadable transcript, and the
+guard raising on a fault of its own. The last is ``main``'s outer guard, which
+runs for every Bash call, so denying there would block commands that are not
+pushes. Dropped (PPA-1765): a fault in this file therefore fails open, visibly.
+What breaks if it is never fixed: the push passes with the warning, as it did
+before this change, and the merge grades the close-out as it always has.
 """
 
 import json
@@ -57,17 +72,29 @@ sys.path.append(str(CLOSE_OUT.parent))
 
 # noqa: E402 below - the sys.path inserts above have to run first.
 from grade_definition_of_done import (  # noqa: E402
+    DOD_FIELD,
     SHAPES,
     jira_get,
     session_keys,
     transcript_records,
 )
-from pr_merge_close_out import checklist_comments  # noqa: E402
+from pr_merge_close_out import (  # noqa: E402
+    UNSTATED,
+    build_table,
+    checklist_comments,
+)
 
 #: Seconds allowed for one Jira read, and for all of them together. Both sit
 #: under the 30-second timeout hooks.json declares for this hook.
 JIRA_TIMEOUT = 8
 BUDGET = 20
+
+#: Printed verbatim in every refusal (PPA-1765 Amendment 2). A gate demanding
+#: one-word verdicts pushes a session to write a bare MET over a qualified one,
+#: and that would let a ticket close itself with a ruling still open.
+VERDICT_RULE = (
+    "If a condition is fully met, write MET. If it carries a qualification or "
+    "awaits a ruling, write NOT MET and put the reason in the evidence.")
 
 #: ``git push`` at the head of a command segment, through any ``-C <dir>`` or
 #: ``-c <key=value>`` git options ahead of the subcommand.
@@ -114,34 +141,90 @@ def is_wip(ref, cwd):
     return git(cwd, "log", "-1", "--format=%s", ref).lower().startswith("wip:")
 
 
-def keys_without_checklist(keys, get=jira_get, clock=time.monotonic):
-    """Each key whose Jira comments state no checklist row. Raises on any
-    failed read, and TimeoutError once ``BUDGET`` is spent."""
+class ReadFailed(Exception):
+    """A Jira read failed. Carries the key being read and the error."""
+
+    def __init__(self, key, error):
+        super().__init__(f"{key}: {error!r}")
+        self.key = key
+        self.error = error
+
+
+def gaps_in(key, issue):
+    """(absent, [(number, text)]) for one key, or None where it is complete.
+
+    ``absent`` is True where no comment states a row at all. The list is each
+    condition the close-out leaves with no stated verdict; with ``absent`` it
+    is every condition.
+    """
+    fields = issue.get("fields") or {}
+    comments = (fields.get("comment") or {}).get("comments")
+    table = build_table(fields.get(DOD_FIELD), comments, key)
+    if not table.conditions:
+        # Empty Definition of Done: nothing to pair, so today's test stands.
+        return None if checklist_comments(comments) else (True, [])
+    if table.absent:
+        return True, list(enumerate(table.conditions, 1))
+    unpaired = [(n, text) for n, text, verdict in table.rows
+                if verdict == UNSTATED]
+    return (False, unpaired) if unpaired else None
+
+
+def keys_with_gaps(keys, get=jira_get, clock=time.monotonic):
+    """[(key, absent, unpaired conditions)] for each key the close-out leaves
+    short. Raises ``ReadFailed`` on any failed read, and on ``BUDGET`` spent."""
     deadline = clock() + BUDGET
-    missing = []
+    found = []
     for key in keys:
         remaining = deadline - clock()
         if remaining <= 0:
-            raise TimeoutError(f"the {BUDGET}s Jira budget ran out before {key}")
-        body = get(f"/issue/{key}/comment?maxResults=100",
-                   timeout=min(JIRA_TIMEOUT, remaining))
-        if not checklist_comments(body.get("comments")):
-            missing.append(key)
-    return missing
+            raise ReadFailed(key, TimeoutError(
+                f"the {BUDGET}s Jira budget ran out before {key}"))
+        try:
+            issue = get(f"/issue/{key}?fields=comment,{DOD_FIELD}",
+                        timeout=min(JIRA_TIMEOUT, remaining))
+        except Exception as exc:  # noqa: BLE001 - any failed read denies, naming the key
+            raise ReadFailed(key, exc) from exc
+        gap = gaps_in(key, issue)
+        if gap:
+            found.append((key, *gap))
+    return found
 
 
-def deny(branch, missing):
+def gap_lines(key, absent, conditions):
+    head = (f"{key} carries no close-out checklist in Jira." if absent
+            else f"{key} leaves a Definition of Done condition with no stated "
+                 "verdict in its Jira close-out comment:")
+    return "\n".join([head, *(f"  {n}. {text}" for n, text in conditions)])
+
+
+def decision(reason):
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": (
-            f"Push guard (PPA-1626): {branch} is not pushed yet, because "
-            f"{', '.join(missing)} carries no close-out checklist in Jira. The "
-            "push lets the pull request merge, and the merge grades the "
-            "checklist already on the ticket, so the order is commit, post the "
-            "checklist, push. Post the checklist on each key named, citing the "
-            "local commit hash, then push again. The extractor reads two shapes "
-            "and no others:\n" + SHAPES)}}
+        "permissionDecisionReason": reason}}
+
+
+def deny(branch, gaps):
+    return decision(
+        f"Push guard (PPA-1626, PPA-1765): {branch} is not pushed yet. The push "
+        "lets the pull request merge, and the merge grades the close-out "
+        "comment already on each ticket, so every Definition of Done condition "
+        "needs a row with a stated verdict first. The order is commit, post the "
+        "checklist, push.\n\n"
+        + "\n\n".join(gap_lines(*gap) for gap in gaps)
+        + "\n\nThe Jira close-out comment is the thing to fix, not the chat "
+        "text. Post the corrected checklist on each key named, citing the local "
+        "commit hash, then push again. The extractor reads two shapes and no "
+        "others:\n" + SHAPES + "\n" + VERDICT_RULE)
+
+
+def deny_read(branch, failure):
+    return decision(
+        f"Push guard (PPA-1765): {branch} is not pushed, because the Jira read "
+        f"for {failure.key} failed: {failure.error!r}. A guard that lets a push "
+        "through on a read error is not a guard (Decision 1A, 01-OCT-2026). "
+        "Fix the read, then push again.")
 
 
 def warn(why):
@@ -165,6 +248,10 @@ def decide(payload, get=jira_get):
     ref, branch = pushed_ref(args, cwd)
     if not branch.startswith("ppa-") or is_wip(ref, cwd):
         return None
+    # Dropped (PPA-1765): the keys graded are the session's dispatched keys, the
+    # set PPA-1626 already used, not every key a commit on the branch names. What
+    # breaks if it is never fixed: a key named on the branch but never dispatched
+    # in this session is first graded by the merge, which holds it, as before.
     try:
         keys, _ = session_keys(transcript_records(payload.get("transcript_path")))
     except OSError as exc:
@@ -172,10 +259,10 @@ def decide(payload, get=jira_get):
     if not keys:
         return None
     try:
-        missing = keys_without_checklist(keys, get)
-    except Exception as exc:  # noqa: BLE001 - a failed read allows, with a warning
-        return warn(f"reading Jira comments failed ({exc!r})")
-    return deny(branch, missing) if missing else None
+        gaps = keys_with_gaps(keys, get)
+    except ReadFailed as failure:
+        return deny_read(branch, failure)
+    return deny(branch, gaps) if gaps else None
 
 
 def main():

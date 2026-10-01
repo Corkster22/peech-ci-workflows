@@ -9,6 +9,7 @@ The stub is what makes this suite fixture-driven rather than live. No test here
 reaches Jira, and none reads the real credential file.
 """
 
+import datetime
 import importlib.util
 import json
 import os
@@ -16,7 +17,9 @@ import re
 import subprocess
 import sys
 import time
+import types
 import urllib.parse
+import zoneinfo
 from pathlib import Path
 
 import pytest
@@ -39,6 +42,20 @@ hook = _load()
 #: the real readers. They are taken from here and patched back in for the one
 #: case that wants them, with ``_jira_get`` stubbed underneath.
 REAL = _load()
+
+#: Jira's field list as far as the hook reads it (PPA-1752): it looks up one
+#: field by name and never writes the identifier into the code.
+FIELD_LIST = [{"id": "customfield_10022", "name": "Target start"},
+              {"id": "customfield_10023", "name": "Target end"}]
+TARGET_START_ID = "customfield_10022"
+
+
+def with_field_list(get):
+    """A ``_jira_get`` stub that answers the field-list read and hands every
+    other path to ``get``, so a stub written for the searches still serves."""
+    def answering(path, timeout=None):
+        return FIELD_LIST if path == "/field" else get(path, timeout)
+    return answering
 
 
 # ``pt_transition.py``'s real output shape, one line per key, no network.
@@ -950,6 +967,8 @@ def typed_backlog(monkeypatch):
     the JQL under test: whichever component clause the query carries decides
     which keys the stubbed Jira hands back."""
     def fake_get(path, timeout=None):
+        if path == "/field":
+            return FIELD_LIST
         jql = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)["jql"][0]
         if jql.startswith("key in"):
             return {"issues": [{"key": k, "fields": {
@@ -1081,6 +1100,8 @@ def test_a_key_with_no_execution_component_has_no_type():
 
 def test_the_dispatch_set_listing_shows_each_keys_work_type(monkeypatch):
     def fake_get(path, timeout=None):
+        if path == "/field":
+            return FIELD_LIST
         if "issuelinks" in path:
             return {"issues": [{"key": k, "fields": {"issuelinks": []}}
                                for k in ("PPA-11", "PPA-21")]}
@@ -1779,8 +1800,8 @@ def issue(key, blockers=(), blocker_status="In Progress"):
 def test_a_ticket_with_an_open_blocker_is_outside_the_dispatchable_set(monkeypatch):
     """The measured case: PPA-1464 blocked by PPA-1456, which was In Progress on
     an unmerged pull request. It is never demanded and never needs an opt-out."""
-    monkeypatch.setattr(hook, "_jira_get", lambda path, timeout=None: {"issues": [
-        issue("PPA-1464", ["PPA-1456"]), issue("PPA-1465")]})
+    monkeypatch.setattr(hook, "_jira_get", with_field_list(lambda path, timeout=None: {"issues": [
+        issue("PPA-1464", ["PPA-1456"]), issue("PPA-1465")]}))
 
     excluded = []
     assert hook.dispatchable_set("REPO: x", excluded=excluded) == ["PPA-1465"]
@@ -1791,8 +1812,8 @@ def test_a_ticket_with_an_open_blocker_is_outside_the_dispatchable_set(monkeypat
 def test_a_resolved_blocker_releases_the_ticket_it_blocked(monkeypatch, status):
     """The second case condition 4 names. Once the blocker lands, the ticket is
     demanded again - the exclusion is a live read, not a property of the link."""
-    monkeypatch.setattr(hook, "_jira_get", lambda path, timeout=None: {"issues": [
-        issue("PPA-1464", ["PPA-1456"], blocker_status=status)]})
+    monkeypatch.setattr(hook, "_jira_get", with_field_list(lambda path, timeout=None: {"issues": [
+        issue("PPA-1464", ["PPA-1456"], blocker_status=status)]}))
 
     excluded = []
     assert hook.dispatchable_set("REPO: x", excluded=excluded) == ["PPA-1464"]
@@ -1801,9 +1822,9 @@ def test_a_resolved_blocker_releases_the_ticket_it_blocked(monkeypatch, status):
 
 def test_a_ticket_with_no_links_is_unaffected(monkeypatch):
     """The third case condition 4 names."""
-    monkeypatch.setattr(hook, "_jira_get", lambda path, timeout=None: {
+    monkeypatch.setattr(hook, "_jira_get", with_field_list(lambda path, timeout=None: {
         "issues": [{"key": "PPA-1", "fields": {}},
-                   {"key": "PPA-2", "fields": {"issuelinks": []}}]})
+                   {"key": "PPA-2", "fields": {"issuelinks": []}}]}))
 
     excluded = []
     assert hook.dispatchable_set("REPO: x", excluded=excluded) == ["PPA-1", "PPA-2"]
@@ -1814,12 +1835,12 @@ def test_the_blocks_direction_does_not_hold_up_the_blocking_ticket(monkeypatch):
     """Only `is blocked by` gates readiness. A ticket that blocks others is not
     itself waiting on anything, and excluding it would drop the ticket the whole
     chain is waiting for."""
-    monkeypatch.setattr(hook, "_jira_get", lambda path, timeout=None: {"issues": [
+    monkeypatch.setattr(hook, "_jira_get", with_field_list(lambda path, timeout=None: {"issues": [
         {"key": "PPA-1456", "fields": {"issuelinks": [
             {"type": {"name": "Blocks", "inward": "is blocked by",
                       "outward": "blocks"},
              "outwardIssue": {"key": "PPA-1464", "fields": {
-                 "status": {"name": "In Progress"}}}}]}}]})
+                 "status": {"name": "In Progress"}}}}]}}]}))
 
     excluded = []
     assert hook.dispatchable_set("REPO: x", excluded=excluded) == ["PPA-1456"]
@@ -1833,7 +1854,7 @@ def test_the_dispatchable_read_asks_for_the_links_it_needs(monkeypatch):
         seen["path"] = path
         return {"issues": []}
 
-    monkeypatch.setattr(hook, "_jira_get", fake_get)
+    monkeypatch.setattr(hook, "_jira_get", with_field_list(fake_get))
     hook.dispatchable_set("REPO: peech-skills")
 
     assert "issuelinks" in seen["path"]
@@ -1866,8 +1887,8 @@ def test_an_unreadable_link_graph_excludes_nothing(monkeypatch):
     """Condition 6, last case. A row whose links cannot be read is left in the
     set rather than dropped - the failure direction that asks too much, not the
     one that goes quiet."""
-    monkeypatch.setattr(hook, "_jira_get", lambda path, timeout=None: {"issues": [
-        {"key": "PPA-1", "fields": {"issuelinks": "not a list at all"}}]})
+    monkeypatch.setattr(hook, "_jira_get", with_field_list(lambda path, timeout=None: {"issues": [
+        {"key": "PPA-1", "fields": {"issuelinks": "not a list at all"}}]}))
 
     excluded = []
     unreadable = []
@@ -1917,6 +1938,8 @@ def test_a_dispatch_makes_no_more_than_two_jira_calls(
 
     def fake_get(path, timeout=None):
         calls.append(path)
+        if path == "/field":
+            return FIELD_LIST
         if "issuelinks" in path:
             return {"issues": []}
         return {"issues": [{"key": "PPA-1416", "fields": {
@@ -1942,8 +1965,13 @@ def test_a_dispatch_makes_no_more_than_two_jira_calls(
 
     assert code == 0, "a well-formed dispatch is not refused"
     assert fired(sandbox) == ["PPA-1416"]
-    assert len(calls) <= 2, f"three reads became two; got {len(calls)}: {calls}"
-    assert len(calls) == 2
+    searches = [path for path in calls if path.startswith("/search/jql?")]
+    assert len(searches) == 2, (
+        f"three searches became two; got {len(searches)}: {calls}")
+    # PPA-1752 added the third read, and it is a lookup rather than a search:
+    # the field list that finds Target start by name, never by identifier.
+    assert calls.count("/field") == 1
+    assert len(calls) == 3
 
 
 def test_the_three_checks_read_one_shared_answer(monkeypatch):
@@ -2483,6 +2511,8 @@ def _backlog_get(calls=None):
     def fake_get(path, timeout=None):
         if calls is not None:
             calls.append(path)
+        if path == "/field":
+            return FIELD_LIST
         if "issuelinks" in path:
             return {"issues": [
                 {"key": "PPA-1", "fields": {"issuelinks": [{
@@ -2555,8 +2585,369 @@ def test_the_mode_exits_zero_on_a_bar_failure_and_one_on_a_read_failure(
 
 
 def test_the_mode_writes_nothing_to_jira(monkeypatch):
-    """Every request the mode makes is a search read."""
+    """Every request the mode makes is a read: the searches, and the field-list
+    read that finds Target start by name (PPA-1752)."""
     calls = []
     monkeypatch.setattr(REAL, "_jira_get", _backlog_get(calls))
     REAL.dispatch_set_lines("peech-skills")
-    assert calls and all(path.startswith("/search/jql?") for path in calls)
+    assert calls and all(path == "/field" or path.startswith("/search/jql?")
+                         for path in calls)
+
+
+# --------------------------------------------------------------------------
+# A ticket held until its Target start is not demanded - PPA-1752
+# --------------------------------------------------------------------------
+
+def today_et():
+    return datetime.datetime.now(zoneinfo.ZoneInfo("America/New_York")).date()
+
+
+def held_backlog(starts, field_list=None):
+    """Open tickets whose Target start is given per key, behind the real
+    field-list read: ``{key: Target start or None}``."""
+    def search(path, timeout=None):
+        return {"issues": [{"key": key, "fields": {
+            "issuelinks": [], TARGET_START_ID: start}}
+            for key, start in starts.items()]}
+
+    def get(path, timeout=None):
+        return (field_list or FIELD_LIST) if path == "/field" else search(path)
+
+    return get
+
+
+def test_a_ticket_with_a_target_start_after_today_is_outside_the_set(monkeypatch):
+    """The measured case: PPA-1559 dispatched against its date hold three
+    times. Tomorrow is held; today, an earlier date and a blank are demanded
+    exactly as before."""
+    today = datetime.date(2026, 10, 1)
+    monkeypatch.setattr(hook, "_jira_get", held_backlog({
+        "PPA-1": "2026-10-02", "PPA-2": "2026-10-01", "PPA-3": None,
+        "PPA-4": "2026-09-30"}))
+
+    held = []
+    assert hook.dispatchable_set("REPO: x", held=held, today=today) == [
+        "PPA-2", "PPA-3", "PPA-4"]
+    assert held == [("PPA-1", datetime.date(2026, 10, 2))]
+
+
+def test_a_date_time_value_is_read_by_its_date(monkeypatch):
+    monkeypatch.setattr(hook, "_jira_get", held_backlog({
+        "PPA-1": "2026-10-02T00:00:00.000-0400"}))
+
+    held = []
+    assert hook.dispatchable_set("REPO: x", held=held,
+                                 today=datetime.date(2026, 10, 1)) == []
+    assert held == [("PPA-1", datetime.date(2026, 10, 2))]
+
+
+def test_today_is_read_in_new_york_not_in_utc(monkeypatch):
+    """23:30 on 01-OCT in New York is already 02-OCT in UTC. A ticket starting
+    on 02-OCT is held at that moment only if the day is read in New York."""
+    class Clock(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.datetime(2026, 10, 1, 23, 30, tzinfo=zoneinfo.ZoneInfo(
+                "America/New_York")).astimezone(tz)
+
+    monkeypatch.setattr(hook, "datetime", types.SimpleNamespace(
+        datetime=Clock, date=datetime.date))
+    monkeypatch.setattr(hook, "_jira_get", held_backlog({"PPA-1": "2026-10-02"}))
+
+    held = []
+    assert hook.dispatchable_set("REPO: x", held=held) == []
+    assert held == [("PPA-1", datetime.date(2026, 10, 2))]
+
+
+def test_the_field_is_found_by_its_name_and_never_by_an_identifier(monkeypatch):
+    """Jira assigns a custom field's identifier per site, so the search asks
+    for whichever identifier the field list gives the name Target start."""
+    seen = []
+    other_site = [{"id": "customfield_99001", "name": "Target start"},
+                  {"id": "customfield_10022", "name": "Baseline Start"}]
+
+    def get(path, timeout=None):
+        seen.append(path)
+        return other_site if path == "/field" else {"issues": []}
+
+    monkeypatch.setattr(hook, "_jira_get", get)
+    hook.dispatchable_set("REPO: x")
+
+    search = next(path for path in seen if path.startswith("/search/jql?"))
+    assert "customfield_99001" in search
+    assert "customfield_10022" not in search
+    assert "customfield_" not in HOOK.read_text().split("TARGET_START =")[1].split(
+        "#: How a Discovery")[0], "no identifier is written beside the name"
+    assert "customfield_10022" not in HOOK.read_text()
+
+
+def test_a_field_list_without_the_name_fails_the_read(monkeypatch):
+    """A missing field is not a ticket with no hold. The read fails, and the
+    completeness check's own policy turns that into a warning."""
+    monkeypatch.setattr(hook, "_jira_get", held_backlog({}, field_list=[
+        {"id": "customfield_10023", "name": "Target end"}]))
+
+    with pytest.raises(LookupError, match="Target start"):
+        hook.dispatchable_set("REPO: x")
+
+
+def test_a_held_ticket_is_named_in_a_warning_and_not_demanded(monkeypatch, capsys):
+    """The warning names each held ticket and its date, as the blocked ones
+    are named, and the dispatch is not refused for omitting it."""
+    tomorrow = today_et() + datetime.timedelta(days=1)
+    monkeypatch.setattr(REAL, "_jira_get", held_backlog({
+        "PPA-1": tomorrow.isoformat(), "PPA-2": None}))
+    monkeypatch.setattr(REAL, "log", lambda *a, **k: None)
+    monkeypatch.setattr(REAL, "repo_components_of",
+                        lambda keys, **kw: dict.fromkeys(keys, "REPO: peech-skills"))
+    monkeypatch.setattr(REAL, "work_types_of", lambda keys, **kw: {"Delegated": keys})
+
+    message = REAL.check_dispatch_complete("PPA-2", ["PPA-2"])
+
+    assert message is None, "PPA-1 is held, so a dispatch of PPA-2 is complete"
+    warning = json.loads(capsys.readouterr().out)["systemMessage"]
+    assert (f"because its Target start is later than today: "
+            f"PPA-1 (held until {tomorrow})") in warning
+
+
+def test_a_dispatch_is_still_refused_for_a_key_not_held(monkeypatch):
+    tomorrow = today_et() + datetime.timedelta(days=1)
+    monkeypatch.setattr(REAL, "_jira_get", held_backlog({
+        "PPA-1": tomorrow.isoformat(), "PPA-2": None, "PPA-3": None}))
+    monkeypatch.setattr(REAL, "log", lambda *a, **k: None)
+    monkeypatch.setattr(REAL, "warn", lambda message: None)
+    monkeypatch.setattr(REAL, "repo_components_of",
+                        lambda keys, **kw: dict.fromkeys(keys, "REPO: peech-skills"))
+    monkeypatch.setattr(REAL, "work_types_of", lambda keys, **kw: {"Delegated": keys})
+
+    message = REAL.check_dispatch_complete("PPA-3", ["PPA-3"])
+
+    assert "named nowhere in this prompt: PPA-2" in message
+    assert "PPA-1" not in message
+
+
+def test_the_dispatch_set_lists_a_held_ticket_after_the_set_marked(monkeypatch):
+    tomorrow = today_et() + datetime.timedelta(days=1)
+    monkeypatch.setattr(REAL, "_jira_get", held_backlog({
+        "PPA-1": tomorrow.isoformat()}))
+
+    assert REAL.dispatch_set_lines("peech-skills") == [
+        f"# not demanded, held until {tomorrow}: PPA-1"]
+
+
+def test_the_listing_orders_blocked_then_held_after_the_set(monkeypatch):
+    tomorrow = (today_et() + datetime.timedelta(days=1)).isoformat()
+    block = {"type": {"inward": "is blocked by"}, "inwardIssue": {
+        "key": "PPA-9", "fields": {"status": {"name": "In Progress"}}}}
+
+    def get(path, timeout=None):
+        if path == "/field":
+            return FIELD_LIST
+        if "issuelinks" in path:
+            return {"issues": [
+                {"key": "PPA-1", "fields": {"issuelinks": [block]}},
+                {"key": "PPA-2", "fields": {"issuelinks": [],
+                                            TARGET_START_ID: tomorrow}},
+                {"key": "PPA-3", "fields": {"issuelinks": []}}]}
+        return {"issues": [{"key": "PPA-3", "fields": {
+            "status": {"name": "To Do"},
+            "components": [{"name": "EXA: Delegated"},
+                           {"name": "REPO: peech-skills"}],
+            "description": adf("## Scope boundary\nOne file."),
+            "customfield_10767": adf("[machine] One condition.")}}]}
+
+    monkeypatch.setattr(REAL, "_jira_get", get)
+
+    assert REAL.dispatch_set_lines("peech-skills") == [
+        "PPA-3\tTo Do\tDelegated\tPASS",
+        "# not demanded, blocked by PPA-9: PPA-1",
+        f"# not demanded, held until {tomorrow}: PPA-2"]
+
+
+# --------------------------------------------------------------------------
+# A Delegated ticket that edits a repository's settings file - PPA-1758
+# --------------------------------------------------------------------------
+
+ROUTE = ("edits .claude/settings.json - work this ticket Guided: chat writes a "
+         "Run Terminal script, the operator runs it (Decision 1A, 01-OCT-2026)")
+
+
+def heading(level, text):
+    return {"type": "heading", "attrs": {"level": level},
+            "content": [{"type": "text", "text": text}]}
+
+
+def para(text):
+    return {"type": "paragraph", "content": [{"type": "text", "text": text}]}
+
+
+def bullets(*items):
+    return {"type": "bulletList", "content": [
+        {"type": "listItem", "content": [para(item)]} for item in items]}
+
+
+def description(*blocks):
+    return {"type": "doc", "version": 1, "content": list(blocks)}
+
+
+def bar_ready(components, description_adf):
+    """The shared read's entry for a ticket that clears every Bar item, so that
+    only the settings check can refuse it."""
+    names = list(components) + ["REPO: peech-ci-workflows"]
+    text = " ".join(hook.flatten_adf(description_adf)) + " Scope boundary"
+    return {"status": "To Do", "components": names,
+            "repo_components": ["REPO: peech-ci-workflows"],
+            "description": text, "dod": "[machine] One condition.",
+            "dod_adf": adf("[machine] One condition."),
+            "description_adf": description_adf}
+
+
+def refusal(components, description_adf, prompt="PPA-9"):
+    return REAL.check_quality_bar(
+        prompt, ["PPA-9"], shared={"PPA-9": bar_ready(components, description_adf)})[0]
+
+
+#: PPA-1757's shape: the file named only in a "Does not touch" list.
+PPA_1757_SHAPE = description(
+    heading(2, "The change"),
+    para("A Stop hook in plugins/pt-automation-hooks/, registered in hooks.json."),
+    heading(2, "Scope boundary"),
+    para("Does not touch:"),
+    bullets("Any repository other than peech-ci-workflows.",
+            ".claude-plugin/marketplace.json, repo-settings.json, or any "
+            "repository's .claude/settings.json.",
+            "Any Claude Code settings file on the Mac."))
+
+#: PPA-1746 step 6: the home-folder file is read without being edited.
+PPA_1746_STEP_6 = description(
+    heading(2, "Change"),
+    para("1. Delete the folder plugins/pt-automation-hooks/ and every file in it."),
+    para("6. Read, without editing, ~/.claude/settings.json, "
+         "~/.claude/plugins/installed_plugins.json and "
+         "~/.claude/plugins/known_marketplaces.json on this Mac."),
+    heading(2, "Scope boundary"),
+    para("Edits the four files named in steps 2 to 5."))
+
+EDITS_SETTINGS = description(
+    heading(2, "Why"),
+    para("The guard refuses the edit."),
+    heading(2, "Change"),
+    para("In .claude/settings.json, replace \"pt-automation-hooks@peech-org\": "
+         "true with \"pt-automation-hooks@peech-ci\": true."),
+    heading(2, "Scope boundary"),
+    para("Does not touch any skill."))
+
+
+def test_a_delegated_ticket_naming_the_file_in_its_change_section_is_refused():
+    message = refusal(["EXA: Delegated"], EDITS_SETTINGS)
+
+    assert f"PPA-9 {ROUTE}" in message
+
+
+def test_a_delegated_ticket_naming_the_file_only_in_its_scope_boundary_is_not():
+    """PPA-1757 is the live example: it names the file only in its "Does not
+    touch" list, and a ticket that lists the file as untouched does not edit
+    it."""
+    assert refusal(["EXA: Delegated"], PPA_1757_SHAPE) is None
+
+
+def test_a_delegated_ticket_naming_only_the_home_file_is_not_refused():
+    """PPA-1746 step 6 is the live example: it reads ~/.claude/settings.json
+    without editing it, and that is the Mac's user settings."""
+    assert refusal(["EXA: Delegated"], PPA_1746_STEP_6) is None
+
+
+@pytest.mark.parametrize("path", [
+    "~/.claude/settings.json", "$HOME/.claude/settings.json",
+    "${HOME}/.claude/settings.json", "/Users/sean/.claude/settings.json",
+    "/home/sean/.claude/settings.json"])
+def test_every_spelling_of_the_home_file_is_the_users_settings(path):
+    ticket = description(heading(2, "Change"), para(f"Read {path} and quote it."))
+    assert refusal(["EXA: Delegated"], ticket) is None
+
+
+@pytest.mark.parametrize("path", [
+    ".claude/settings.json", "peech-skills/.claude/settings.json",
+    "`.claude/settings.json`"])
+def test_a_repository_relative_spelling_is_a_match(path):
+    ticket = description(heading(2, "Change"), para(f"Edit {path} to add a key."))
+    assert refusal(["EXA: Delegated"], ticket) is not None
+
+
+def test_a_change_section_naming_both_files_is_a_match():
+    ticket = description(heading(2, "Change"), para(
+        "Read ~/.claude/settings.json, then edit .claude/settings.json."))
+    assert refusal(["EXA: Delegated"], ticket) is not None
+
+
+def test_a_guided_ticket_naming_the_file_in_its_change_section_is_not_refused():
+    """Guided tickets are never refused by this check. A Guided ticket carries
+    no execution component, so it is the Bar's to refuse, and the settings
+    route is not in what it says."""
+    fields = bar_ready([], EDITS_SETTINGS)
+    assert REAL.edits_repo_settings(fields) is False
+
+    message = REAL.check_quality_bar("PPA-9", ["PPA-9"], shared={"PPA-9": fields})[0]
+    assert ROUTE not in (message or "")
+
+
+def test_a_discovery_ticket_is_not_a_delegated_ticket():
+    assert refusal(["EXA: Delegated Discovery"], EDITS_SETTINGS) is None
+
+
+def test_a_sub_heading_stays_inside_the_change_section_and_the_next_one_ends_it():
+    inside = description(heading(2, "Change"), heading(3, "Step 4"),
+                         para("Edit .claude/settings.json."))
+    after = description(heading(2, "Change"), para("Edit one file."),
+                        heading(2, "Notes"), para("Not .claude/settings.json."))
+
+    assert refusal(["EXA: Delegated"], inside) is not None
+    assert refusal(["EXA: Delegated"], after) is None
+
+
+@pytest.mark.parametrize("title", ["Change", "The change", "Changes"])
+def test_the_change_heading_is_matched_in_the_forms_tickets_use(title):
+    ticket = description(heading(2, title), para("Edit .claude/settings.json."))
+    assert refusal(["EXA: Delegated"], ticket) is not None
+
+
+def test_a_description_with_no_change_heading_is_not_read():
+    ticket = description(para("Edit .claude/settings.json."))
+    assert refusal(["EXA: Delegated"], ticket) is None
+
+
+def test_naming_the_key_again_below_the_dispatch_line_is_the_opt_out():
+    """The Bar's opt-out. PPA-1758's own Change section describes this check and
+    names the file, so a re-dispatch of it needs a way past."""
+    assert refusal(["EXA: Delegated"], EDITS_SETTINGS,
+                   prompt="PPA-9\n\nPPA-9 describes the check, it does not edit "
+                          "the file.") is None
+
+
+def test_the_refusal_and_a_bar_failure_are_reported_together():
+    fields = bar_ready(["EXA: Delegated"], EDITS_SETTINGS)
+    fields["dod"] = ""
+
+    message = REAL.check_quality_bar("PPA-9", ["PPA-9"], shared={"PPA-9": fields})[0]
+
+    assert "missing a non-empty Definition of Done" in message
+    assert f"PPA-9 {ROUTE}" in message
+
+
+def test_the_description_rides_out_of_the_one_shared_read(monkeypatch):
+    """PPA-1465's rule holds: the unflattened description costs no second call."""
+    seen = []
+
+    def get(path, timeout=None):
+        seen.append(path)
+        return {"issues": [{"key": "PPA-9", "fields": {
+            "status": {"name": "To Do"},
+            "components": [{"name": "EXA: Delegated"}],
+            "description": EDITS_SETTINGS, "customfield_10767": adf("x")}}]}
+
+    monkeypatch.setattr(REAL, "_jira_get", get)
+    fields = REAL.dispatched_fields(["PPA-9"])["PPA-9"]
+
+    assert len(seen) == 1
+    assert fields["description_adf"] == EDITS_SETTINGS
+    assert REAL.edits_repo_settings(fields) is True
