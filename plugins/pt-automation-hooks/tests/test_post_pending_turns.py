@@ -31,6 +31,7 @@ def _load():
     return module
 
 
+REAL_HOME = Path.home()
 pending = _load()
 worklog = pending.worklog
 
@@ -92,6 +93,7 @@ def home(tmp_path, monkeypatch):
     env.write_text("JIRA_EMAIL=s@example.test\nJIRA_API_TOKEN=j\n"
                    "TEMPO_FM_OAUTH_TOKEN=t\nSLACK_BOT_TOKEN=x\n")
     monkeypatch.setattr(pending, "PROJECTS", projects)
+    monkeypatch.setattr(pending, "SWEPT", tmp_path / "swept.json")
     monkeypatch.setattr(worklog, "CREDENTIALS", env)
     monkeypatch.setattr(worklog, "LOG", tmp_path / "hook.log")
     monkeypatch.setattr(worklog, "ALERTS", tmp_path / "alerts.json")
@@ -177,7 +179,7 @@ def test_a_turn_before_the_cutoff_is_not_posted(home, monkeypatch):
     assert router.posts == []
 
 
-def test_every_earlier_session_is_swept_oldest_first(home, monkeypatch):
+def test_every_earlier_session_is_swept_newest_first(home, monkeypatch):
     first = session(home, "one", [prompt("PPA-1"), turn(A_UUID, 100)])
     second = session(home, "two", [prompt("PPA-2"), turn(B_UUID, 100)])
     now = time.time()
@@ -186,7 +188,7 @@ def test_every_earlier_session_is_swept_oldest_first(home, monkeypatch):
 
     _, router = start(monkeypatch)
 
-    assert [p["issueId"] for p in router.posts] == [45001, 45002]
+    assert [p["issueId"] for p in router.posts] == [45002, 45001]
     assert len([c for c in router.calls if c[1].endswith("/myself")]) == 1
 
 
@@ -238,6 +240,7 @@ def test_a_slack_failure_is_logged_and_the_hook_exits_0(home, monkeypatch):
 
 
 def test_a_missing_credentials_file_exits_0_and_logs(home, monkeypatch):
+    session(home, "old", [prompt("PPA-1774"), turn(A_UUID, 100)])
     (home / ".env").unlink()
     code, router = start(monkeypatch)
     assert (code, router.calls) == (0, [])
@@ -302,3 +305,236 @@ def test_both_hooks_round_through_the_one_function(monkeypatch, home):
 
     assert [p["timeSpentSeconds"] for p in router.posts] == [7777]
     assert pending.worklog is worklog
+
+
+# --- running out of time is a clean stop (PPA-1774 rework) --------------------
+#
+# 02-OCT-2026 13:44: the first live sweep covered 122 sessions and 124 keys, hit
+# the 25-second deadline, logged a failed alert and posted nothing. These cases
+# drive the real http_json against a Tempo that answers slowly, on a fake clock.
+
+
+class Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class SlowServer:
+    """Jira, Tempo and Slack in one, behind urlopen. Each request takes ``delay``
+    seconds of the fake clock, and a request given less time than that times out
+    after using the time it was given, as a socket does. Worklogs persist across
+    runs, as Tempo's do."""
+
+    def __init__(self, clock, delay):
+        self.clock, self.delay = clock, delay
+        self.delay_for = lambda url: self.delay
+        self.worklogs = {}
+        self.requests = []
+        self.messages = []
+
+    def urlopen(self, req, timeout):
+        url, method = req.full_url, req.get_method()
+        self.requests.append((method, url))
+        delay = self.delay_for(url)
+        if delay > timeout:
+            self.clock.advance(timeout)
+            raise TimeoutError("The read operation timed out")
+        self.clock.advance(delay)
+        body = json.loads(req.data) if req.data else None
+        if "slack.com/api/" in url:
+            if url.endswith("/chat.postMessage"):
+                self.messages.append(body["text"])
+            reply = {"ok": True, "user": {"id": "U1"}, "channel": {"id": "D1"}}
+        elif url.endswith("/myself"):
+            reply = {"accountId": worklog.SEAN}
+        elif "/worklogs/issue/" in url:
+            issue = int(re.search(r"/issue/(\d+)", url).group(1))
+            reply = {"results": [{"description": d} for d in self.worklogs.get(issue, [])],
+                     "metadata": {}}
+        elif method == "POST":
+            self.worklogs.setdefault(body["issueId"], []).append(body["description"])
+            reply = {}
+        else:
+            reply = {"id": str(45000 + int(re.search(r"-(\d+)\?", url).group(1)))}
+        return Reply(json.dumps(reply).encode())
+
+    @property
+    def posted(self):
+        return sorted(d for descriptions in self.worklogs.values() for d in descriptions)
+
+    @property
+    def jira_lookups(self):
+        return [url for method, url in self.requests if "/issue/PPA-" in url]
+
+
+class Reply:
+    def __init__(self, raw):
+        self.raw = raw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self.raw
+
+
+@pytest.fixture
+def slow(home, monkeypatch):
+    """A slow Tempo (3 s a request) on a fake clock; ``again`` starts a new run."""
+    clock = Clock()
+    server = SlowServer(clock, delay=3)
+    monkeypatch.setattr(worklog.urllib.request, "urlopen", server.urlopen)
+    monkeypatch.setattr(worklog, "time", clock)
+
+    def again():
+        worklog._started = clock.monotonic()
+        monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+        return pending.main()
+
+    server.again = again
+    return server
+
+
+def four_sessions(home):
+    """Four earlier sessions, each with one keyed turn on its own key, oldest first."""
+    now = time.time()
+    for n in range(1, 5):
+        path = session(home, f"s{n}", [prompt(f"PPA-{n}"), turn(f"u{n}", 100)])
+        os.utime(path, (now - 500 + n * 10, now - 500 + n * 10))
+
+
+def progress(home):
+    return json.loads((home / "swept.json").read_text())
+
+
+def test_a_sweep_that_reaches_the_time_limit_keeps_its_posts_and_exits_0(home, slow):
+    four_sessions(home)
+
+    assert slow.again() == 0
+
+    done = slow.posted
+    assert 0 < len(done) < 4, "some turns posted before the limit, not all"
+    assert len(done) == len(set(done)), "nothing posted twice"
+    assert set(progress(home)["sessions"]) == {f"s{n}" for n in (4, 3, 2, 1)[:len(done)]}, (
+        "the settled sessions are the newest ones, and only those")
+    assert [line for line in log_lines(home) if "the next start continues" in line]
+
+
+def test_the_next_start_continues_where_it_stopped_and_posts_nothing_twice(home, slow):
+    four_sessions(home)
+
+    slow.again()
+    first = slow.posted
+    settled = set(progress(home)["sessions"])
+    slow.requests.clear()
+    slow.again()
+
+    assert len(slow.posted) == 4
+    assert len(slow.posted) == len(set(slow.posted)), "no turn posted twice across the two starts"
+    assert set(first) <= set(slow.posted), "every post already made was kept"
+    for done in settled:
+        assert not [u for _, u in slow.requests if f"/issue/PPA-{done[1:]}?" in u], (
+            f"{done} was settled and costs no request on the next start")
+    assert set(progress(home)["sessions"]) == {"s1", "s2", "s3", "s4"}
+
+
+def test_a_start_with_everything_settled_makes_no_request_at_all(home, slow):
+    four_sessions(home)
+    slow.again()
+    slow.again()
+    slow.requests.clear()
+
+    slow.again()
+
+    assert slow.requests == []
+
+
+def test_the_newest_session_is_posted_first(home, slow):
+    four_sessions(home)
+    slow.again()
+    assert f"cc-turn:s4:u4" in slow.posted
+
+
+def test_the_time_limit_sends_no_alert_and_logs_one_line(home, slow):
+    """02-OCT-2026 13:44:47 logged the deadline as an alert that was not sent."""
+    four_sessions(home)
+
+    slow.again()
+
+    assert slow.messages == []
+    lines = log_lines(home)
+    assert len(lines) == 1 and "the next start continues" in lines[0]
+    assert "alert not sent" not in lines[0]
+
+
+def test_an_alert_the_time_limit_cut_off_is_sent_at_the_next_start(home, slow):
+    now = time.time()
+    for n in range(1, 11):
+        path = session(home, f"quiet{n}", [prompt("hello"), turn(f"q{n}", 100)])
+        os.utime(path, (now - 500 + n, now - 500 + n))
+
+    slow.again()
+    first = len(slow.messages)
+    for _ in range(5):
+        slow.again()
+
+    assert 0 < first < 10, "the limit cut the alerts short"
+    assert not [line for line in log_lines(home) if "alert not sent" in line], (
+        "an alert cut off by the limit is retried, not logged as a failure")
+    assert len(slow.messages) == 10, "each session is told once, over several starts"
+    assert len(set(slow.messages)) == 10
+
+
+def test_a_server_too_slow_to_answer_is_not_a_failed_post_and_sends_no_alert(home, slow):
+    """Tempo's reads take 6 s, past the 5 s socket timeout, with the deadline
+    still far off: a slow answer, not a failed post, so no direct message and
+    one log line."""
+    slow.delay_for = lambda url: 6 if "/worklogs/issue/" in url else 3
+    session(home, "s1", [prompt("PPA-1"), turn("u1", 100)])
+
+    assert slow.again() == 0
+
+    assert slow.messages == [] and slow.posted == []
+    lines = log_lines(home)
+    assert len(lines) == 1 and "TimeoutError" in lines[0]
+    assert progress(home)["sessions"] == {}, "an unsettled session is retried"
+
+
+def test_a_session_that_grows_is_swept_again(home, slow):
+    path = session(home, "s1", [prompt("PPA-1"), turn("u1", 100)])
+    slow.again()
+    assert len(slow.posted) == 1
+
+    path.write_text(path.read_text() + json.dumps(turn("u2", 100)) + "\n")
+    slow.again()
+
+    assert slow.posted == ["cc-turn:s1:u1", "cc-turn:s1:u2"]
+
+
+def test_a_key_looked_up_once_is_not_looked_up_again(home, slow):
+    now = time.time()
+    first = session(home, "a", [prompt("PPA-7"), turn("ua", 100)])
+    slow.again()
+    lookups = len(slow.jira_lookups)
+    second = session(home, "b", [prompt("PPA-7"), turn("ub", 100)])
+    os.utime(second, (now + 5, now + 5))
+
+    slow.again()
+
+    assert len(slow.jira_lookups) == lookups, "the issue id came from the ledger"
+    assert len(slow.posted) == 2
+
+
+def test_no_test_in_this_file_can_write_to_the_operators_ledger(home):
+    operators = REAL_HOME / ".claude"
+    for path in (pending.SWEPT, worklog.ALERTS, worklog.LOG):
+        assert str(operators) not in str(path)
