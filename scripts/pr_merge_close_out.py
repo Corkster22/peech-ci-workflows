@@ -1834,7 +1834,7 @@ def held_by_workflow(comments):
 #: comment. The comment clause is a text-index match and is confirmed against
 #: the comment bodies afterwards, because ``~`` is word-based and will return a
 #: ticket that merely quotes the phrase.
-HELD_JQL = (f'project = PPA AND status = "{MERGED_FROM}" '
+HELD_JQL = (f'project in ({", ".join(PREFIXES)}) AND status = "{MERGED_FROM}" '
             f'AND comment ~ "{HELD_MARK}" ORDER BY updated ASC')
 
 
