@@ -44,6 +44,8 @@ from datetime import datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from transition_on_prompt import PREFIX_ALT, TICKET_PREFIXES  # noqa: E402
 TOOL = "mcp__atlassian-rovo__createJiraIssue"
 LOG = Path.home() / ".claude" / "pt-spawn-label-hook.log"
 LABEL = "spawned"
@@ -51,9 +53,10 @@ JIRA_TIMEOUT = 10
 
 #: The new issue's key in the tool's response, as a JSON field whether the
 #: response is an object or a JSON string nested inside one.
-_KEY_RE = re.compile(r'\\?"key\\?"\s*:\s*\\?"(PPA-\d+)\\?"')
-_BROWSE_RE = re.compile(r"/browse/(PPA-\d+)\b")
-_ANY_KEY_RE = re.compile(r"\bPPA-\d+\b")
+_KEY_RE = re.compile(
+    rf'\\?"key\\?"\s*:\s*\\?"((?:{PREFIX_ALT})-\d+)\\?"')
+_BROWSE_RE = re.compile(rf"/browse/((?:{PREFIX_ALT})-\d+)\b")
+_ANY_KEY_RE = re.compile(rf"\b(?:{PREFIX_ALT})-\d+\b")
 
 
 def log(reason, **fields):
@@ -131,7 +134,7 @@ def main():
             log("other-tool", tool=payload.get("tool_name"))
             return 0
         tool_input = payload.get("tool_input") or {}
-        if str(tool_input.get("projectKey", "")).upper() != "PPA":
+        if str(tool_input.get("projectKey", "")).upper() not in TICKET_PREFIXES:
             log("not-ppa", project=tool_input.get("projectKey"))
             return 0
         keys = _deny_hook().dispatched_keys(payload)

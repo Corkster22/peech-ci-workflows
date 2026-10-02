@@ -770,3 +770,19 @@ def test_no_row_is_filed_against_a_ticket_it_does_not_name(
     assert "PPA-1613 condition 4: NOT MET." in reason
     assert "PPA-1612" not in reason, reason
     assert "row(s)" not in reason, reason
+
+
+def test_a_peechpmo_close_out_is_graded_like_a_ppa_one(tmp_path, monkeypatch, capsys):
+    """PPA-1825. A PEECHPMO-only dispatch returned nothing-dispatched, so the
+    stop was never graded."""
+    close_out = (
+        "| # | Condition | Verdict |\n"
+        "| --- | --- | --- |\n"
+        "| 1 | The grader refuses a stop when any condition has no verdict | MET |\n")
+    code, out, _ = run(monkeypatch, capsys, {
+        "transcript_path": transcript(
+            tmp_path, "PEECHPMO-1519\n\nBuild it as written.", close_out),
+    })
+    assert code == 0
+    assert out["decision"] == "block"
+    assert "PEECHPMO-1519 condition 2: no verdict in this turn." in out["reason"]

@@ -360,3 +360,14 @@ def test_created_key_matches_the_summary_exactly(monkeypatch):
     assert hook.created_key("The board header reads oddly",
                             "2026-09-23T10:00:00-04:00") == "PPA-2"
     assert "2026-09-22" in seen[0] and seen[0].startswith("/search/jql?jql=")
+
+
+def test_a_peechpmo_create_inside_the_boundary_is_denied(run):
+    """PPA-1825. A create in PEECHPMO was logged not-ppa and allowed."""
+    decision, _, records = run(
+        "drive_folders.py prints a path twice", project="PEECHPMO",
+        dispatch="PEECHPMO-997",
+        description="libs/shared/peech_shared/drive_folders.py line 40")
+
+    assert decision == "deny", f"expected deny, got {decision}"
+    assert records[-1]["reason"] == "denied"

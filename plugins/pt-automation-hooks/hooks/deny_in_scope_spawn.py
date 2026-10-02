@@ -96,6 +96,7 @@ from pathlib import Path
 # then extended this copy alone, so it is the one to edit from here.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from refresh_ci_workflows import CLONE_SCRIPTS  # noqa: E402
+from transition_on_prompt import TICKET_PREFIXES  # noqa: E402
 
 TOOL = "mcp__atlassian-rovo__createJiraIssue"
 LOG = Path.home() / ".claude" / "pt-spawn-control-hook.log"
@@ -342,7 +343,7 @@ def main():
             log("other-tool", tool=payload.get("tool_name"))
             return 0
         tool_input = payload.get("tool_input") or {}
-        if str(tool_input.get("projectKey", "")).upper() != "PPA":
+        if str(tool_input.get("projectKey", "")).upper() not in TICKET_PREFIXES:
             log("not-ppa", project=tool_input.get("projectKey"))
             return 0
         keys = dispatched_keys(payload)

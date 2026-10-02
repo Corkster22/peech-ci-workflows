@@ -151,3 +151,21 @@ def test_the_hooks_json_matcher_is_the_tool_the_hook_checks():
     matchers = [block["matcher"] for block in config["hooks"]["PostToolUse"]
                 if any(HOOK.name in h["command"] for h in block["hooks"])]
     assert matchers == [hook.TOOL]
+
+
+def test_a_dispatched_peechpmo_create_is_labelled_and_linked(run):
+    """PPA-1825. No label or link was written for a PEECHPMO spawn."""
+    response = [{"type": "text", "text": json.dumps({
+        "id": "45401", "key": "PEECHPMO-700",
+        "self": "https://api.atlassian.com/ex/jira/x/rest/api/3/issue/45401"})}]
+
+    writes, _, records = run(dispatch="PEECHPMO-507", project="PEECHPMO",
+                             response=response)
+
+    assert writes == [
+        ("PUT", "/issue/PEECHPMO-700",
+         {"update": {"labels": [{"add": "spawned"}]}}),
+        ("POST", "/issueLink", {"type": {"name": "Relates"},
+                                "inwardIssue": {"key": "PEECHPMO-507"},
+                                "outwardIssue": {"key": "PEECHPMO-700"}})]
+    assert records[-1]["reason"] == "labelled"

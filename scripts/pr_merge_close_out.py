@@ -526,7 +526,12 @@ MERGED_TO_DONE = "Done"
 #: "[machine]" appearing later in a condition's prose declares nothing.
 CLASS_RE = re.compile(r"^\s*\[(machine|conductor|observer)\]", re.IGNORECASE)
 
-#: A PPA key in a commit message, and not one of the three things that look like
+#: The ticket prefixes a merge may close out, defined once for the three key
+#: patterns below. PEECHPMO is Mac Fleet's space (PPA-1825).
+PREFIXES = ("PPA", "PEECHPMO")
+PREFIX_ALT = "|".join(PREFIXES)
+
+#: A ticket key in a commit message, and not one of the three things that look like
 #: one. The lookbehind rejects a path or URL segment (``/PPA-1264``) and a word
 #: prefix (``XPPA-1264``); the first lookahead rejects a longer token
 #: (``PPA-1155-findings``); the second rejects a file extension
@@ -540,7 +545,8 @@ CLASS_RE = re.compile(r"^\s*\[(machine|conductor|observer)\]", re.IGNORECASE)
 #: workflow does exactly that rather than widening this rule, because widening
 #: it would let every mention of ``docs/spikes/PPA-1155-findings.md`` in a
 #: commit body transition PPA-1155.
-KEY_RE = re.compile(r"(?<![\w/.-])(PPA-\d+)(?![\w-])(?!\.\w)", re.IGNORECASE)
+KEY_RE = re.compile(
+    rf"(?<![\w/.-])((?:{PREFIX_ALT})-\d+)(?![\w-])(?!\.\w)", re.IGNORECASE)
 
 #: GitHub's squash-merge subject ends with the pull request number.
 PR_RE = re.compile(r"\(#(\d+)\)")
@@ -556,7 +562,7 @@ PR_RE = re.compile(r"\(#(\d+)\)")
 #: found one of them. Only the leading run of numeric segments is read, so the
 #: match stops at the first word - ``ppa-1264-short-slug`` is still one key, and
 #: a slug's own digits are never reachable because a word always precedes them.
-BRANCH_KEYS_RE = re.compile(r"^ppa-(\d+(?:-\d+)*)", re.IGNORECASE)
+BRANCH_KEYS_RE = re.compile(rf"^({PREFIX_ALT})-(\d+(?:-\d+)*)", re.IGNORECASE)
 
 #: A commit subject as GitHub writes it into a squash body: one ``* `` bullet
 #: per commit on the branch, in the ``type: description (PPA-###)`` form
@@ -586,7 +592,8 @@ SUBJECT_BULLET_RE = re.compile(
 #: The group is a group rather than a single key because a commit legitimately
 #: carries two: ``fix: Bar check at dispatch; malformed line warns
 #: (PPA-1427, PPA-1434)`` is main's own e4b7dce.
-OWN_KEYS_RE = re.compile(r"\(([^()]*PPA-\d+[^()]*)\)", re.IGNORECASE)
+OWN_KEYS_RE = re.compile(
+    rf"\(([^()]*(?:{PREFIX_ALT})-\d+[^()]*)\)", re.IGNORECASE)
 
 
 # ------------------------------------------------------------------- parsing
@@ -609,7 +616,10 @@ def keys_from_branch(head_ref):
     PPA-1464. See BRANCH_KEYS_RE for why only the leading run is read.
     """
     match = BRANCH_KEYS_RE.match((head_ref or "").strip())
-    return [f"PPA-{n}" for n in match.group(1).split("-")] if match else []
+    if not match:
+        return []
+    prefix = match.group(1).upper()
+    return [f"{prefix}-{n}" for n in match.group(2).split("-")]
 
 
 def key_from_branch(head_ref):
