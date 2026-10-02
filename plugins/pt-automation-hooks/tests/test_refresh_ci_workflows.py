@@ -159,7 +159,8 @@ def test_the_hooks_json_command_runs_it_with_home_moved(tmp_path):
     clone exists there and the step warns and exits 0."""
     (command,) = [h["command"]
                   for block in json.loads((HOOK.parent / "hooks.json").read_text())
-                  ["hooks"]["SessionStart"] for h in block["hooks"]]
+                  ["hooks"]["SessionStart"] for h in block["hooks"]
+                  if "refresh_ci_workflows.py" in h["command"]]
     env = {**os.environ, "HOME": str(tmp_path),
            "CLAUDE_PLUGIN_ROOT": str(HOOK.parents[1])}
     proc = subprocess.run(["sh", "-c", command], capture_output=True, text=True,

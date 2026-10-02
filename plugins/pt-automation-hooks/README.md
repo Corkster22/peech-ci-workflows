@@ -16,16 +16,17 @@ nothing.
 - Claude Code writes a turn's row after that turn's Stop hooks run, so the hook
   posts every row not yet tagged in Tempo, not only the latest. Rows that
   ended before 2026-09-24 00:00 ET never post, because the 23-SEP backfill
-  covered them. A session's final turn posts only when a later Stop in that
-  session finds its row, or when PPA-1756's script is re-run.
+  covered them. A session's final turn posts when the next session starts (see
+  below), or when PPA-1756's script is re-run.
 - Several keys in the dispatch split the turn evenly. The first key takes the
   remainder seconds.
-- Tempo refuses a worklog under one minute, so a part under 60 seconds posts as
-  exactly 60 seconds. This is deliberate (Sean's ruling, Decision 1B): conductor
-  time is not captured at all, so the timesheet already runs short, and each
-  post can overstate its part by at most 59 seconds. A part of 60 seconds or
-  more posts at its real length. Nothing is held across turns, and no worklog
-  bundles several turns.
+- Every post rounds its part up to the next multiple of 360 seconds, one tenth of
+  an hour (Sean's ruling, 02-OCT-2026): 1 to 360 seconds posts as 360, 361 to
+  720 as 720, and so on. Only Claude Code time is captured, so totals run low,
+  and six-minute steps are the professional norm. A post overstates its part by
+  at most 359 seconds, and a part of zero seconds posts nothing. One function,
+  `round_up`, holds the rule for both hooks. Nothing is held across turns, and
+  no worklog bundles several turns.
 - Each worklog carries `billableSeconds` 0 and the tag
   `cc-turn:<session_id>:<uuid of the turn_duration row>` as its description. A
   part counts as posted when its tag is in a worklog description on that key's
@@ -33,6 +34,29 @@ nothing.
   PPA-1756's catch-up writes the same tag.
 - Credentials are `TEMPO_FM_OAUTH_TOKEN`, `JIRA_EMAIL` and `JIRA_API_TOKEN` in
   `peech-pmo-automation/secrets/.env`.
+
+### Posting the last turn of a session (`hooks/post_pending_turns.py`)
+
+PPA-1774. A session's final turn has no later Stop, so a SessionStart hook posts
+it. When any session starts (`startup`, `resume`, `clear`, `compact` or `fork`),
+the hook posts every turn from earlier sessions that Tempo does not yet show. It
+sweeps only sessions whose project folder is one of `peech-pmo-automation`,
+`peech-skills`, `peech-org-skills` and `peech-ci-workflows`, and only turns
+ending on or after the Stop hook's cutoff. It uses the Stop hook's parser,
+split, rounding, tag and alerts, so a turn either hook posted is never posted
+twice. It prints nothing, never blocks a start, and leaves work at its deadline
+for the next start.
+
+### Alerts
+
+Sean gets one Slack direct message, at most one per session per reason, when a
+Tempo post fails and when a turn carries no dispatch key. The message names the
+session, the turn's end time, its length and the reason. The bot token is
+`SLACK_BOT_TOKEN` in the same credentials file, and Sean's Slack user is found
+from `JIRA_EMAIL` there. Sent messages are recorded in
+`~/.claude/pt-turn-worklog-alerts.json`. A Slack failure is written to the log
+and never blocks a turn or a start. The bot needs the `im:write`,
+`users:read` and `users:read.email` scopes (`chat:write` to post).
 
 ### The hook never blocks a turn
 

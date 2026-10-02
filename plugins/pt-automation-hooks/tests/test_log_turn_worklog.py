@@ -2,8 +2,9 @@
 
 Each case drives main() end to end: a Stop payload on stdin, a transcript on
 disk, a credentials file in tmp_path, and the HTTP layer replaced by a router
-that records every request. No case reaches Tempo or Jira. What the hook
-posted is read off the recorder.
+that records every request. No case reaches Tempo, Jira or Slack. What the hook
+posted is read off the recorder. PPA-1774 added the rounding and the alerts;
+the SessionStart half has its own file, test_post_pending_turns.py.
 """
 
 import importlib.util
@@ -49,14 +50,24 @@ class Router:
     """Stands in for http_json and records every request."""
 
     def __init__(self, *, account=hook.SEAN, existing=(), by_issue=None, fail=None,
-                 fail_post=None, missing=None):
-        """``existing`` descriptions sit on every issue, ``by_issue`` on one."""
+                 fail_post=None, missing=None, slack=None):
+        """``existing`` descriptions sit on every issue, ``by_issue`` on one.
+        ``fail_post`` fails Tempo posts only; ``slack`` is the exception, or the
+        method name whose reply is not ok, that Slack answers with."""
         self.account, self.existing, self.fail = account, list(existing), fail
         self.by_issue, self.fail_post, self.missing = by_issue or {}, fail_post, missing
+        self.slack = slack
         self.calls = []
 
     def __call__(self, method, url, headers, body=None):
         self.calls.append((method, url, headers, body))
+        if "slack.com/api/" in url:
+            name = url.split("/api/")[1].split("?")[0]
+            if isinstance(self.slack, Exception):
+                raise self.slack
+            if self.slack == name:
+                return {"ok": False, "error": "missing_scope"}
+            return {"ok": True, "user": {"id": "U1"}, "channel": {"id": "D1"}}
         if self.fail or (self.fail_post and method == "POST"):
             raise self.fail or self.fail_post
         if url.endswith("/myself"):
@@ -73,7 +84,15 @@ class Router:
 
     @property
     def posts(self):
-        return [body for method, _, _, body in self.calls if method == "POST"]
+        """The Tempo worklogs posted."""
+        return [body for method, url, _, body in self.calls
+                if method == "POST" and "tempo.io" in url]
+
+    @property
+    def messages(self):
+        """The Slack direct messages sent, as their text."""
+        return [body["text"] for _, url, _, body in self.calls
+                if url.endswith("/chat.postMessage")]
 
 
 @pytest.fixture
@@ -83,6 +102,7 @@ def run(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     monkeypatch.setattr(hook, "LOG", log)
     monkeypatch.setattr(hook, "CREDENTIALS", env)
+    monkeypatch.setattr(hook, "ALERTS", tmp_path / "alerts.json")
 
     def go(rows, *, router=None, credentials=True, payload=None, transcript=True):
         router = router or Router()
@@ -92,7 +112,7 @@ def run(tmp_path, monkeypatch):
             path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
         if credentials:
             env.write_text("JIRA_EMAIL=s@example.test\nJIRA_API_TOKEN=j\n"
-                           "TEMPO_FM_OAUTH_TOKEN='t'\n")
+                           "TEMPO_FM_OAUTH_TOKEN='t'\nSLACK_BOT_TOKEN=x\n")
         body = payload if payload is not None else json.dumps(
             {"session_id": SESSION, "transcript_path": str(path)})
         monkeypatch.setattr(sys, "stdin", io.StringIO(body))
@@ -203,7 +223,7 @@ def test_a_key_dash_note_dispatch_posts_on_its_key(run):
 
 def test_a_prose_line_naming_a_key_posts_nothing(run):
     code, router, lines = run([prompt("PPA-1700 is failing, why?"), TURN])
-    assert (code, router.calls, lines) == (0, [], [])
+    assert (code, router.posts, lines) == (0, [], [])
 
 
 def test_the_latest_dispatch_holds_until_the_next(tmp_path):
@@ -228,7 +248,7 @@ def test_tool_results_and_meta_rows_are_not_dispatches(tmp_path):
 
 def test_a_turn_with_no_dispatch_posts_nothing(run):
     code, router, lines = run([prompt("hello"), TURN])
-    assert (code, router.calls, lines) == (0, [], [])
+    assert (code, router.posts, lines) == (0, [], [])
 
 
 # --- the split --------------------------------------------------------------
@@ -249,7 +269,7 @@ def test_one_key_posts_one_non_billable_worklog_for_sean(run):
     assert (code, lines) == (0, [])
     assert router.posts == [{
         "issueId": 46757, "authorAccountId": hook.SEAN, "startDate": "2026-09-24",
-        "startTime": "17:34:49", "timeSpentSeconds": 486, "billableSeconds": 0,
+        "startTime": "17:34:49", "timeSpentSeconds": 720, "billableSeconds": 0,
         "description": TAG}]
     method, url, headers, _ = router.calls[-1]
     assert (method, url) == ("POST", "https://api.tempo.io/4/worklogs")
@@ -265,7 +285,7 @@ def test_the_tag_is_the_description_character_for_character(run):
 def test_several_keys_split_the_turn_and_sum_to_it(run):
     _, router, _ = run([prompt("PPA-1, PPA-2, PPA-3"), turn(durationMs=310000)])
     assert [(p["issueId"], p["timeSpentSeconds"]) for p in router.posts] == [
-        (45001, 104), (45002, 103), (45003, 103)]
+        (45001, 360), (45002, 360), (45003, 360)]
     assert {p["description"] for p in router.posts} == {TAG}
 
 
@@ -380,46 +400,50 @@ def test_a_network_failure_stops_the_run_with_one_log_line(run):
     _one_line(lines, turn_name=f"cc-turn:{SESSION}:a", reason="TimeoutError")
 
 
-# --- Amendments 2 and 3: Tempo's one-minute floor ---------------------------
+# --- PPA-1774 Amendment 2: six-minute rounding --------------------------------
 #
-# Found live by PPA-1756 on 01-OCT-2026: Tempo rejects any worklog under 60 s
-# with HTTP 400 "Duration must be at least one minute". Amendment 3 (Decision
-# 1B) rounds a part under a minute up to exactly 60 s, posts a longer part at
-# its real length, and holds and bundles nothing. The per-tag, per-issue posted
-# check of Amendment 2 stays.
+# Ruling, Sean, 02-OCT-2026 (PPA-1785 comment 30928): every automated worklog
+# rounds its seconds up to the next multiple of 360, one tenth of an hour. A
+# part of zero seconds posts nothing. Tempo's refusal of a worklog under 60
+# seconds is met by the same rule, since the smallest post is 360. The per-tag,
+# per-issue posted check stays.
 
 
 def secs(uuid, seconds, end="2026-09-30T14:00:00.000Z"):
     return turn(uuid=uuid, durationMs=seconds * 1000, timestamp=end)
 
 
-@pytest.mark.parametrize("real, posted", [
-    (1, 60), (30, 60), (59, 60), (60, 60), (61, 61), (120, 120), (485, 485)])
-def test_a_part_under_a_minute_posts_sixty_seconds_and_a_longer_one_its_real_length(
-        run, real, posted):
+ROUNDING = [(1, 360), (359, 360), (360, 360), (361, 720), (485, 720),
+            (3600, 3600), (3601, 3960)]
+
+
+@pytest.mark.parametrize("real, posted", ROUNDING)
+def test_round_up_takes_real_seconds_to_posted_seconds(real, posted):
+    assert hook.round_up(real) == posted
+
+
+def test_round_up_of_zero_is_zero():
+    assert hook.round_up(0) == 0
+
+
+@pytest.mark.parametrize("real, posted", ROUNDING)
+def test_one_key_posts_the_rounded_seconds(run, real, posted):
     code, router, lines = run([prompt("PPA-1"), secs("a", real)])
     assert (code, lines) == (0, [])
     assert [p["timeSpentSeconds"] for p in router.posts] == [posted]
 
 
-def test_a_multi_key_turn_with_parts_under_a_minute_posts_sixty_seconds_per_key(run):
+def test_100_seconds_over_three_keys_posts_360_on_each(run):
     """100 s over three keys is 34, 33 and 33."""
     _, router, _ = run([prompt("PPA-1, PPA-2, PPA-3"), secs("a", 100)])
     assert [(p["issueId"], p["timeSpentSeconds"]) for p in router.posts] == [
-        (45001, 60), (45002, 60), (45003, 60)]
+        (45001, 360), (45002, 360), (45003, 360)]
 
 
-def test_a_multi_key_turn_with_parts_over_a_minute_posts_their_real_lengths(run):
-    """150 s over two keys is 75 and 75."""
-    _, router, _ = run([prompt("PPA-1, PPA-2"), secs("a", 150)])
-    assert [p["timeSpentSeconds"] for p in router.posts] == [75, 75]
-
-
-def test_a_zero_second_part_posts_nothing(run):
-    """2 s over three keys is 2, 0 and 0. A zero part would overstate by 60 s,
-    past the 59 s Decision 1B allows, so only the first key posts."""
+def test_2_seconds_over_three_keys_posts_360_on_the_first_key_only(run):
+    """2 s over three keys is 2, 0 and 0. A zero part posts nothing."""
     _, router, _ = run([prompt("PPA-1, PPA-2, PPA-3"), secs("a", 2)])
-    assert [(p["issueId"], p["timeSpentSeconds"]) for p in router.posts] == [(45001, 60)]
+    assert [(p["issueId"], p["timeSpentSeconds"]) for p in router.posts] == [(45001, 360)]
 
 
 def test_a_turn_that_rounds_to_zero_seconds_posts_nothing(run):
@@ -428,12 +452,12 @@ def test_a_turn_that_rounds_to_zero_seconds_posts_nothing(run):
 
 
 def test_every_slice_posts_on_its_own_and_nothing_is_held_or_bundled(run):
-    """Four short turns on one key: four worklogs of 60 s, one tag each, so no
+    """Four short turns on one key: four worklogs of 360 s, one tag each, so no
     slice waits for a later Stop and no worklog carries several turns."""
     rows = [prompt("PPA-1")] + [secs(u, 20) for u in "abcd"]
     _, router, _ = run(rows)
     assert [(p["timeSpentSeconds"], p["description"]) for p in router.posts] == [
-        (60, f"cc-turn:{SESSION}:{u}") for u in "abcd"]
+        (360, f"cc-turn:{SESSION}:{u}") for u in "abcd"]
 
 
 def test_a_later_stop_posts_only_the_slices_not_yet_in_tempo(run):
@@ -442,10 +466,10 @@ def test_a_later_stop_posts_only_the_slices_not_yet_in_tempo(run):
     assert [p["description"] for p in router.posts] == [f"cc-turn:{SESSION}:b"]
 
 
-def test_no_post_is_under_a_minute_or_overstates_a_part_by_more_than_59_seconds(run):
-    """Two keys over mixed turns: each post is max(part, 60), its tag is on
-    the issue once, and it overstates its part by at most 59 seconds."""
-    durations = [95, 10, 61, 7, 200, 3, 59, 1, 121]
+def test_every_post_is_a_multiple_of_360_and_overstates_its_part_by_at_most_359(run):
+    """Two keys over mixed turns: each post is the part rounded up, its tag is
+    on the issue once, and it overstates its part by at most 359 seconds."""
+    durations = [95, 10, 61, 7, 200, 3, 59, 1, 121, 721, 3601]
     rows = [prompt("PPA-1, PPA-2")] + [secs(f"u{i}", d) for i, d in enumerate(durations)]
     _, router, _ = run(rows)
     for index, issue in enumerate((45001, 45002)):
@@ -453,10 +477,109 @@ def test_no_post_is_under_a_minute_or_overstates_a_part_by_more_than_59_seconds(
         mine = [p for p in router.posts if p["issueId"] == issue]
         assert len(mine) == len(parts)
         for post, part in zip(mine, parts):
-            assert post["timeSpentSeconds"] == max(part, 60)
-            assert post["timeSpentSeconds"] - part <= 59
+            assert post["timeSpentSeconds"] % 360 == 0
+            assert post["timeSpentSeconds"] >= 360
+            assert 0 <= post["timeSpentSeconds"] - part <= 359
         tags = [p["description"] for p in mine]
         assert len(tags) == len(set(tags)) and all(" " not in t for t in tags)
+
+
+def test_no_edit_or_delete_request_is_ever_made(run):
+    """A worklog already in Tempo is never edited, re-rounded or deleted."""
+    _, router, _ = run([prompt("PPA-1"), secs("a", 20), secs("b", 700)])
+    assert {c[0] for c in router.calls} <= {"GET", "POST"}
+    for source in (HOOK, HOOK.with_name("post_pending_turns.py")):
+        assert not re.search(r"""["'](PUT|DELETE|PATCH)["']""", source.read_text()), source
+
+
+# --- PPA-1774 alerts: one Slack direct message per session per reason ---------
+
+
+def test_a_failed_tempo_post_sends_one_direct_message_and_exits_0(run):
+    router = Router(fail_post=RuntimeError("POST https://api.tempo.io/4/worklogs -> HTTP 400"))
+    code, router, lines = run([prompt("PPA-1"), secs("a", 20), secs("b", 20)], router=router)
+    assert code == 0
+    assert len(router.messages) == 1
+    message = router.messages[0]
+    assert "a Tempo post failed" in message and f"Session {SESSION}" in message
+    assert "2026-09-30 10:00 ET" in message and "length 0m 20s" in message
+    assert "HTTP 400" in message
+
+
+def test_the_direct_message_goes_to_the_user_found_by_the_jira_email(run):
+    router = Router(fail_post=RuntimeError("HTTP 400"))
+    _, router, _ = run([prompt("PPA-1"), secs("a", 20)], router=router)
+    lookup, opened, sent = [c for c in router.calls if "slack.com" in c[1]]
+    assert lookup[1].endswith("/users.lookupByEmail?email=s%40example.test")
+    assert opened[3] == {"users": "U1"}
+    assert sent[3]["channel"] == "D1"
+    assert sent[2] == {"Authorization": "Bearer x"}
+
+
+def test_two_keys_failing_in_one_session_send_one_message(run):
+    """Each key's post fails, and the session is told once for the reason."""
+    router = Router(fail_post=RuntimeError("HTTP 400"))
+    _, router, _ = run([prompt("PPA-1, PPA-2"), secs("a", 20)], router=router)
+    assert len(router.messages) == 1
+
+
+def test_a_ticketless_turn_sends_one_direct_message_and_posts_nothing(run):
+    code, router, lines = run([prompt("hello"), TURN])
+    assert (code, router.posts, lines) == (0, [], [])
+    assert len(router.messages) == 1
+    assert "no dispatch key" in router.messages[0]
+    assert f"Session {SESSION}" in router.messages[0]
+    assert "length 8m 6s" in router.messages[0]
+
+
+def test_at_most_one_message_per_session_per_reason(run):
+    """Two ticketless turns, and a second Stop in the same session."""
+    rows = [prompt("hello"), secs("a", 20), secs("b", 30)]
+    _, router, _ = run(rows)
+    assert len(router.messages) == 1
+    _, again, _ = run(rows)
+    assert again.messages == []
+    assert again.calls == [], "a reported session makes no request at all"
+
+
+def test_a_different_session_is_messaged_again(run, monkeypatch, tmp_path):
+    run([prompt("hello"), TURN])
+    other = json.dumps({"session_id": "other", "transcript_path": str(tmp_path / "t.jsonl")})
+    _, router, _ = run([prompt("hello"), TURN], payload=other)
+    assert len(router.messages) == 1
+
+
+def test_two_reasons_in_one_session_send_two_messages(run):
+    router = Router(fail_post=RuntimeError("HTTP 400"))
+    _, router, _ = run([prompt("hello"), secs("n", 20), prompt("PPA-1"), secs("a", 20)],
+                       router=router)
+    assert len(router.messages) == 2
+
+
+def test_a_slack_failure_is_logged_and_the_hook_exits_0(run):
+    code, router, lines = run([prompt("hello"), TURN], router=Router(slack=OSError("down")))
+    assert code == 0
+    _one_line(lines, turn_name=TAG, reason="alert not sent: OSError: down")
+
+
+def test_a_slack_reply_that_is_not_ok_is_logged_and_retried_at_the_next_run(run):
+    """The bot cannot open a direct message: the missing scope is in the log."""
+    code, router, lines = run([prompt("hello"), TURN], router=Router(slack="conversations.open"))
+    assert code == 0 and router.messages == []
+    _one_line(lines, turn_name=TAG, reason="missing_scope")
+    _, again, _ = run([prompt("hello"), TURN])
+    assert len(again.messages) == 1, "not recorded as sent, so it is tried again"
+
+
+def test_a_failed_message_does_not_stop_the_tempo_posts(run):
+    _, router, _ = run([prompt("hello"), secs("n", 20), prompt("PPA-1"), secs("a", 20)],
+                       router=Router(slack=OSError("down")))
+    assert [p["issueId"] for p in router.posts] == [45001]
+
+
+def test_anyone_but_sean_is_never_messaged(run):
+    _, router, _ = run([prompt("hello"), TURN], router=Router(account="712020:someone-else"))
+    assert router.messages == []
 
 
 def test_a_posted_check_is_per_tag_and_per_issue(run):
@@ -464,7 +587,7 @@ def test_a_posted_check_is_per_tag_and_per_issue(run):
     router = Router(by_issue={45001: [TAG]})
     _, router, _ = run([prompt("PPA-1, PPA-2"), TURN], router=router)
     assert [(p["issueId"], p["timeSpentSeconds"], p["description"])
-            for p in router.posts] == [(45002, 243, TAG)]
+            for p in router.posts] == [(45002, 360, TAG)]
 
 
 def test_a_tag_on_another_issue_does_not_count_as_posted(run):
@@ -517,7 +640,7 @@ def test_a_timeout_exits_0_with_one_log_line(run):
 def test_a_key_jira_cannot_resolve_does_not_stop_the_other_keys(run):
     code, router, lines = run([prompt("PPA-1, PPA-2"), TURN], router=Router(missing="PPA-2"))
     assert code == 0
-    assert [(p["issueId"], p["timeSpentSeconds"]) for p in router.posts] == [(45001, 243)]
+    assert [(p["issueId"], p["timeSpentSeconds"]) for p in router.posts] == [(45001, 360)]
     _one_line(lines, turn_name=TAG, reason="HTTP 404")
 
 
