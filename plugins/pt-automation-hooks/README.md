@@ -44,8 +44,18 @@ sweeps only sessions whose project folder is one of `peech-pmo-automation`,
 `peech-skills`, `peech-org-skills` and `peech-ci-workflows`, and only turns
 ending on or after the Stop hook's cutoff. It uses the Stop hook's parser,
 split, rounding, tag and alerts, so a turn either hook posted is never posted
-twice. It prints nothing, never blocks a start, and leaves work at its deadline
-for the next start.
+twice. It prints nothing and never blocks a start.
+
+It keeps its progress in `~/.claude/pt-turn-worklog-swept.json`: the sessions it
+has settled, by transcript size, and the Jira issue id of each key. A start skips
+a settled session without a request, and a start with nothing left makes none.
+It sweeps the newest session first. The first live run, 02-OCT-2026, needed about
+250 requests for 122 sessions and ran out of its 25 seconds with nothing posted;
+now running out of time is a clean stop. It keeps every post already made, sends
+no alert, writes one log line (`deadline reached after N sessions settled; the
+next start continues`), and the next start picks up the sessions not yet settled,
+so a long backlog clears over a few starts. A post is tagged, so none is posted
+twice. Delete the file to sweep everything again.
 
 ### Alerts
 

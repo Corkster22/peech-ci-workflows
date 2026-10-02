@@ -66,7 +66,10 @@ the hook exits 0. The hooks.json wrapper is fail-open and carries a timeout,
 and ``DEADLINE`` stops this file's own calls before that timeout does, so a
 slow Tempo never holds a turn open. A key that fails on its own data, such as
 one Jira cannot resolve, is logged and the other keys still post. A network or
-timeout failure ends the run, and the next Stop retries.
+timeout failure ends the run, and the next Stop retries. Running out of the
+hook's own time raises ``DeadlineReached``, a ``TimeoutError`` that is never
+alerted, because nothing failed. This hook logs it with the other timeouts; the
+SessionStart sweep treats it as a clean stop (PPA-1774 rework).
 
 This hook never deletes or edits a worklog. Tempo DELETE leaves the Jira
 mirror worklog behind, so undoing a post means deleting both sides.
@@ -244,17 +247,33 @@ def load_env(path):
     return env
 
 
+class DeadlineReached(TimeoutError):
+    """This hook ran out of its own time (``DEADLINE``), not out of luck.
+
+    A subclass of ``TimeoutError`` so every handler that already ends a run on a
+    timeout still does. The difference is that the work is fine: nothing failed,
+    so nothing is alerted, and whatever is left is picked up at the next run.
+    """
+
+
 def http_json(method, url, headers, body=None):
-    """One JSON request. Raises on any HTTP, network or timeout failure."""
+    """One JSON request. Raises on any HTTP, network or timeout failure, and
+    raises ``DeadlineReached`` when the hook's own time is spent."""
     left = DEADLINE - (time.monotonic() - _started)
     if left <= 0:
-        raise TimeoutError("hook deadline reached before the request")
+        raise DeadlineReached("hook deadline reached before the request")
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers={
         "Accept": "application/json", "Content-Type": "application/json", **headers})
     try:
         with urllib.request.urlopen(req, timeout=min(HTTP_TIMEOUT, left)) as resp:
             raw = resp.read()
+    except TimeoutError as exc:
+        # A request cut short by the deadline, rather than a slow server, reads
+        # as a timeout too (the log of 02-OCT-2026 13:44:47).
+        if time.monotonic() - _started >= DEADLINE - 0.5:
+            raise DeadlineReached("hook deadline reached during the request") from exc
+        raise
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"{method} {url} -> HTTP {exc.code}") from exc
     return json.loads(raw) if raw else {}
@@ -263,12 +282,14 @@ def http_json(method, url, headers, body=None):
 class Poster:
     """Sean's Jira and Tempo calls, each lookup made once per run."""
 
-    def __init__(self, env):
+    def __init__(self, env, ids=None):
+        """``ids`` is a key-to-issue-id map a caller kept from an earlier run.
+        An issue id never changes, so a kept one saves a Jira request."""
         self.jira = {"Authorization": "Basic " + base64.b64encode(
             f"{env['JIRA_EMAIL']}:{env['JIRA_API_TOKEN']}".encode()).decode()}
         self.tempo = {"Authorization": f"Bearer {env['TEMPO_FM_OAUTH_TOKEN']}"}
         self.descriptions = {}
-        self.ids = {}
+        self.ids = dict(ids or {})
 
     def is_sean(self):
         return http_json("GET", f"{JIRA}/myself", self.jira).get("accountId") == SEAN
@@ -383,6 +404,8 @@ class Alerts:
                 f"length {seconds // 60}m {seconds % 60}s.\n{detail}").rstrip()})
             ALERTS.parent.mkdir(parents=True, exist_ok=True)
             ALERTS.write_text(json.dumps(sorted(_alerted() | {sent_key})))
+        except DeadlineReached:
+            raise  # not sent, not recorded: the next run sends it
         except Exception as exc:  # noqa: BLE001 - an alert never blocks a turn
             log(tag(session_id, row.get("uuid", "?")), f"alert not sent: {type(exc).__name__}: {exc}")
 
@@ -409,23 +432,34 @@ def needs_work(session_id, marked):
 def sweep(poster, alerts, session_id, marked):
     """Post every turn in ``marked`` that Tempo does not yet show, and alert.
 
+    Returns True when the session is settled: every part is in Tempo and any
+    no-key alert is recorded as sent. False means something is left for a later
+    run (a key that failed on its own data, or an alert Slack did not accept).
+
     ``poster`` and ``alerts`` are built once by the caller, so a start that
     sweeps many sessions asks Jira and Slack for each lookup once. A network or
-    timeout failure raises, ending the caller's run; the next run retries.
+    timeout failure raises, ending the caller's run; ``DeadlineReached`` passes
+    through without an alert, because running out of time is not a failed post.
     """
+    settled = True
     if (nokey := next((row for row, keys in marked if not keys), None)) is not None:
         alerts.send(session_id, NO_KEY, nokey,
                     "Put the ticket keys on the first line of the next prompt.")
+        settled = f"{session_id}|{NO_KEY}" in _alerted()
     todo = [(row, keys) for row, keys in marked if keys]
     for key, parts in parts_by_key(session_id, todo).items():
         try:
             poster.post_key(key, parts)
+        except TimeoutError:
+            raise  # a slow server or the deadline: end the run, nothing to alert
         except Exception as exc:  # noqa: BLE001 - this key's own data, or the network
             alerts.send(session_id, "a Tempo post failed", parts[0][2],
                         f"{key}: {type(exc).__name__}: {exc}")
             if isinstance(exc, OSError):
-                raise  # network or timeout: end the run; the caller logs it
+                raise  # network failure: end the run; the caller logs it
             log(parts[0][0], f"{type(exc).__name__}: {exc}")
+            settled = False
+    return settled
 
 
 def main():
