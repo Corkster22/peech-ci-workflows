@@ -2425,6 +2425,8 @@ def test_the_held_search_asks_for_the_status_and_the_mark():
     assert closeout.held_keys(get) == ["PPA-1", "PPA-2"]
     assert closeout.HELD_MARK in closeout.HELD_JQL
     assert f'status = "{closeout.MERGED_FROM}"' in closeout.HELD_JQL
+    # PPA-1825: a held PEECHPMO ticket is re-graded like a held PPA one.
+    assert "project in (PPA, PEECHPMO)" in closeout.HELD_JQL
     assert asked[0].startswith("/search/jql?")
 
 

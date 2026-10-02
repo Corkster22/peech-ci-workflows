@@ -450,3 +450,23 @@ def test_an_empty_definition_of_done_keeps_the_one_row_test(repo):
     assert hook.decide(payload(repo, dispatch="PPA-1"), allowed) is None
     assert "PPA-1 carries no close-out checklist" in reason_of(
         hook.decide(payload(repo, dispatch="PPA-1"), denied))
+
+
+def test_denies_a_peechpmo_push_with_no_checklist(repo):
+    """PPA-1825. A peechpmo-* branch was allowed with no Jira read."""
+    git(repo, "checkout", "-q", "-b", "peechpmo-1-guard")
+    get = jira({"PEECHPMO-1": [PROSE]})
+
+    decision = denial(hook.decide(payload(repo, dispatch="PEECHPMO-1"), get))
+
+    assert decision.get("permissionDecision") == "deny"
+    assert "PEECHPMO-1 carries no close-out checklist" in decision[
+        "permissionDecisionReason"]
+
+
+def test_allows_a_branch_matching_neither_prefix_without_reading_jira(repo):
+    git(repo, "checkout", "-q", "-b", "feature/x")
+    get = jira({})
+
+    assert hook.decide(payload(repo), get) is None
+    assert get.calls == []

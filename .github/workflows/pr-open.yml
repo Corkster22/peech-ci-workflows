@@ -32,6 +32,7 @@ on:
   push:
     branches:
       - "ppa-*"
+      - "peechpmo-*"
   workflow_call:
     secrets:
       PEECH_AUTOMATION_TOKEN:
@@ -145,7 +146,7 @@ jobs:
           # work, so scanning commit bodies transitioned every cited ticket too.
           # There is deliberately no fallback to that scan: a branch with no key
           # in its name transitions nothing.
-          key=$(printf '%s' "${HEAD_REF}" | grep -oiE 'ppa-[0-9]+' | head -1 \
+          key=$(printf '%s' "${HEAD_REF}" | grep -oiE '(ppa|peechpmo)-[0-9]+' | head -1 \
             | tr '[:lower:]' '[:upper:]' || true)
           if [ -z "${key}" ]; then
             echo "SKIP: branch '${HEAD_REF}' carries no PPA key in its name."
@@ -193,12 +194,12 @@ jobs:
 
           echo "branch: ${HEAD_REF}"
 
-          # Guard 1 — the branch name matches ppa-*. The trigger's `branches:`
+          # Guard 1 — the branch name matches ppa-* or peechpmo-*. The trigger's `branches:`
           # filter already enforces this; the guard stays because a filter and a
           # rule are different things, and this job should refuse a branch it
           # was somehow handed rather than assume the trigger vouched for it.
           case "${HEAD_REF}" in
-            ppa-*) ;;
+            ppa-*|peechpmo-*) ;;
             *)
               echo "SKIP: branch '${HEAD_REF}' does not match ppa-*."
               echo "Only ticket branches get a pull request opened for them."
@@ -275,7 +276,7 @@ jobs:
           # present but named in no commit message: use the newest commit's
           # subject and append the key, so the squash carries it even when the
           # commit did not.
-          key=$(printf '%s' "${HEAD_REF}" | grep -oiE 'ppa-[0-9]+' | head -1 \
+          key=$(printf '%s' "${HEAD_REF}" | grep -oiE '(ppa|peechpmo)-[0-9]+' | head -1 \
             | tr '[:lower:]' '[:upper:]' || true)
           newest=$(git log -1 --pretty=%s HEAD)
 
@@ -294,7 +295,7 @@ jobs:
           echo "title: ${title}"
 
           keys=$(git log --pretty=%B origin/main..HEAD \
-            | grep -oE 'PPA-[0-9]+' | awk '!seen[$0]++' || true)
+            | grep -oE '(PPA|PEECHPMO)-[0-9]+' | awk '!seen[$0]++' || true)
           if [ -z "${keys}" ]; then
             echo "note: no PPA key found in the branch's commit messages."
             echo "Opening anyway; the body names the branch instead."

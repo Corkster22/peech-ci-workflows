@@ -3172,3 +3172,43 @@ def test_a_check_that_cannot_be_imported_warns_and_allows(monkeypatch, capsys):
 
     assert REAL.merge_wait_conditions(fields) == []
     assert "merge-wait check not run" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# PPA-1825 - a PEECHPMO key is a dispatch key
+# --------------------------------------------------------------------------
+
+def test_a_peechpmo_dispatch_line_transitions_its_key(sandbox, capsys):
+    install_stub(sandbox)
+
+    code, _ = run("PEECHPMO-507", capsys=capsys)
+
+    assert code == 0
+    assert fired(sandbox) == ["PEECHPMO-507"]
+
+
+def test_a_mixed_ppa_and_peechpmo_line_is_accepted_not_refused(sandbox, capsys):
+    install_stub(sandbox)
+    line = "PPA-1825, PEECHPMO-507"
+
+    code, out = run(line, capsys=capsys)
+
+    assert (code, out) == (0, "")
+    assert capsys.readouterr().err == ""
+    assert fired(sandbox) == ["PPA-1825", "PEECHPMO-507"]
+    assert hook.dispatched_keys(line) == ["PPA-1825", "PEECHPMO-507"]
+    assert hook.malformed_dispatch_warning(line) is None
+
+
+def test_two_ppa_keys_and_a_peechpmo_key_are_not_refused(sandbox, capsys):
+    install_stub(sandbox)
+
+    code, _ = run("PPA-1, PPA-2, PEECHPMO-3", capsys=capsys)
+
+    assert code == 0
+    assert fired(sandbox) == ["PPA-1", "PPA-2", "PEECHPMO-3"]
+
+
+def test_a_prefix_neither_ppa_nor_peechpmo_is_still_no_dispatch():
+    assert hook.dispatched_keys("AISD2026-5") == []
+    assert hook.keys_in("XPEECHPMO-5") == []

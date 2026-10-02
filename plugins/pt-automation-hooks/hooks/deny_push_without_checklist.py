@@ -56,6 +56,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from refresh_ci_workflows import CLONE_SCRIPTS  # noqa: E402
+from transition_on_prompt import BRANCH_PREFIXES  # noqa: E402
 
 # The one copy of pr_merge_close_out.py, in the peech-ci-workflows clone
 # (PPA-1605), beside the one copy of pt_transition.py it imports (PPA-1662).
@@ -246,7 +247,7 @@ def decide(payload, get=jira_get):
     # skips the check and the merge holds the ticket, as it did before this.
     cwd =str(Path(payload.get("cwd") or os.getcwd(), directory or "."))
     ref, branch = pushed_ref(args, cwd)
-    if not branch.startswith("ppa-") or is_wip(ref, cwd):
+    if not branch.startswith(BRANCH_PREFIXES) or is_wip(ref, cwd):
         return None
     # Dropped (PPA-1765): the keys graded are the session's dispatched keys, the
     # set PPA-1626 already used, not every key a commit on the branch names. What

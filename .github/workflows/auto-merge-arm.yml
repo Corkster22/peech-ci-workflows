@@ -131,7 +131,7 @@ jobs:
             # opened by hand from another branch is not armed here; merge it
             # yourself when it is ready.
             case "${head}" in
-              ppa-*) ;;
+              ppa-*|peechpmo-*) ;;
               *) echo "    SKIP: '${head}' does not match ppa-*."; continue ;;
             esac
 

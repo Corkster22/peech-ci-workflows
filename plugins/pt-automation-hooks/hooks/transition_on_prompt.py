@@ -539,10 +539,18 @@ DISCOVERY_LAUNCH = "claude --model opus --effort high"
 #: see "Every failure is also logged" above.
 LOG = Path.home() / ".claude" / "pt-transition-hook.log"
 
-_KEY_RE = re.compile(r"\bPPA-\d+\b", re.IGNORECASE)
+#: The ticket prefixes a dispatch line may carry, defined once. The hooks that
+#: match a key or a branch import these rather than spell a prefix again, so a
+#: third prefix is one edit (PPA-1825: PEECHPMO is Mac Fleet's space).
+TICKET_PREFIXES = ("PPA", "PEECHPMO")
+PREFIX_ALT = "|".join(TICKET_PREFIXES)
+#: A branch is named for its first key: ``ppa-<n>`` or ``peechpmo-<n>``.
+BRANCH_PREFIXES = tuple(f"{p.lower()}-" for p in TICKET_PREFIXES)
+
+_KEY_RE = re.compile(rf"\b(?:{PREFIX_ALT})-\d+\b", re.IGNORECASE)
 
 #: ``pt_transition.py`` prints one line per key: ``KEY 'from' -> 'to' hops=N VERDICT``.
-_VERDICT_RE = re.compile(r"^(PPA-\d+)\b.*\b(PASS|NOOP|HALT)\b")
+_VERDICT_RE = re.compile(rf"^((?:{PREFIX_ALT})-\d+)\b.*\b(PASS|NOOP|HALT)\b")
 
 #: A HALT is deliberately absent: it means the key did not move, so it is retried.
 _SETTLED = ("PASS", "NOOP")

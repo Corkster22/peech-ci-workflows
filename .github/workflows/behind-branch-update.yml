@@ -76,7 +76,7 @@ jobs:
             --json number,headRefName,isDraft,createdAt,autoMergeRequest \
             --jq 'sort_by(.createdAt)
                   | map(select(.autoMergeRequest != null))
-                  | map(select(.headRefName | test("^ppa-")))
+                  | map(select(.headRefName | test("^(ppa|peechpmo)-")))
                   | map(select(.isDraft == false))
                   | .[].number')
 

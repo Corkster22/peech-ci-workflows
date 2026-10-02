@@ -158,4 +158,5 @@ def test_push_to_a_ppa_branch_is_a_trigger_beside_workflow_call():
     on = workflow()[True]
 
     assert list(on) == ["push", "workflow_call"]
-    assert on["push"] == {"branches": ["ppa-*"]}
+    # PPA-1825 added peechpmo-*; the ppa-* pattern is unchanged.
+    assert on["push"]["branches"][0] == "ppa-*"

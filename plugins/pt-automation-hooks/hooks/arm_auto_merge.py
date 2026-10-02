@@ -137,6 +137,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from transition_on_prompt import BRANCH_PREFIXES  # noqa: E402
+
 #: The single credential home for every copy of this hook, and the same
 #: absolute path pt_transition.py has held since PPA-1126. One .env is one
 #: place to rotate a token; peech-skills has no secrets/ directory and no
@@ -296,7 +299,7 @@ def session_branches(root, started_at, current):
     assumed: dropping it leaves a four-branch session's set unchanged at four,
     and takes the inherited-branch case from two branches to one.
     """
-    ordered = [current] if current.startswith("ppa-") else []
+    ordered = [current] if current.startswith(BRANCH_PREFIXES) else []
     if started_at is None:
         return ordered
     reflog = git(root, "reflog", "show", "--date=unix", "--format=%gd|%gs", "HEAD")
@@ -309,7 +312,7 @@ def session_branches(root, started_at, current):
             # entry predates the session too.
             break
         for name in (match.group(3), match.group(2)):
-            if name.startswith("ppa-") and name not in ordered:
+            if name.startswith(BRANCH_PREFIXES) and name not in ordered:
                 ordered.append(name)
     return ordered
 

@@ -453,3 +453,22 @@ class TestTheSlugParse:
     ])
     def test_every_remote_spelling_resolves_to_owner_and_name(self, url):
         assert hook._SLUG_RE.search(url).group(1) == "Corkster22/peech-skills"
+
+
+class TestAPeechpmoBranchIsATicketBranch:
+    """PPA-1825. The SessionEnd arm took only ppa-* branches."""
+
+    def test_a_peechpmo_branch_with_an_open_pull_request_is_armed(self, rig):
+        rig.state["branch"] = "peechpmo-501"
+        assert rig.run(pr_rows=OPEN_PR) == 0
+        assert ["gh", "pr", "merge", "46", "--repo",
+                "Corkster22/peech-pmo-automation", "--auto",
+                "--squash"] in rig.recorder.gh_argvs
+        assert rig.records()[-1]["outcome"] == "armed"
+
+    def test_the_reflog_set_carries_both_prefixes(self, monkeypatch):
+        log = reflog((1300, "peechpmo-501", "ppa-1407"),
+                     (1200, "feature/x", "peechpmo-501"))
+        monkeypatch.setattr(hook, "git", lambda root, *args: log)
+        assert hook.session_branches("/repo", 1000, "ppa-1407") == [
+            "ppa-1407", "peechpmo-501"]
