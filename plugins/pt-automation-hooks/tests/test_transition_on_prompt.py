@@ -91,13 +91,19 @@ def never_the_operators_own_log(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(hook, "LOG",
                         tmp_path / "hook-log" / "pt-transition-hook.log")
+    # REAL is a second instance of the module with its own LOG, and the Bar
+    # tests drive it directly. It was left on the operator's file: one run of
+    # this file appended 14 records to ~/.claude/pt-transition-hook.log.
+    monkeypatch.setattr(REAL, "LOG",
+                        tmp_path / "real-log" / "pt-transition-hook.log")
 
 
-def test_no_test_in_this_file_can_write_to_the_operators_own_log():
+@pytest.mark.parametrize("module", [hook, REAL], ids=["hook", "REAL"])
+def test_no_test_in_this_file_can_write_to_the_operators_own_log(module):
     """The fixture above, asserted rather than trusted. A test that reaches the
     operator's home directory is the failure; the path is the evidence."""
-    assert str(Path.home() / ".claude") not in str(hook.LOG), (
-        f"a test in this file would write to {hook.LOG}, which is under the "
+    assert str(Path.home() / ".claude") not in str(module.LOG), (
+        f"a test in this file would write to {module.LOG}, which is under the "
         f"operator's own ~/.claude directory")
 
 
