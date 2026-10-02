@@ -91,13 +91,19 @@ def never_the_operators_own_log(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(hook, "LOG",
                         tmp_path / "hook-log" / "pt-transition-hook.log")
+    # REAL is a second instance of the module with its own LOG, and the Bar
+    # tests drive it directly. It was left on the operator's file: one run of
+    # this file appended 14 records to ~/.claude/pt-transition-hook.log.
+    monkeypatch.setattr(REAL, "LOG",
+                        tmp_path / "real-log" / "pt-transition-hook.log")
 
 
-def test_no_test_in_this_file_can_write_to_the_operators_own_log():
+@pytest.mark.parametrize("module", [hook, REAL], ids=["hook", "REAL"])
+def test_no_test_in_this_file_can_write_to_the_operators_own_log(module):
     """The fixture above, asserted rather than trusted. A test that reaches the
     operator's home directory is the failure; the path is the evidence."""
-    assert str(Path.home() / ".claude") not in str(hook.LOG), (
-        f"a test in this file would write to {hook.LOG}, which is under the "
+    assert str(Path.home() / ".claude") not in str(module.LOG), (
+        f"a test in this file would write to {module.LOG}, which is under the "
         f"operator's own ~/.claude directory")
 
 
@@ -1503,6 +1509,9 @@ def test_flatten_adf_reads_an_absent_field_as_empty():
 
 MALFORMED = "Work PPA-1424, PPA-1425 and PPA-1426."
 
+#: One key plus words. PPA-1784 keeps the PPA-1434 behavior for it: warn, allow.
+ONE_KEY_MALFORMED = "PPA-1783 apply output below"
+
 
 def test_a_first_line_of_keys_and_separators_dispatches(sandbox, capsys):
     """The qualifying form, unchanged."""
@@ -1512,25 +1521,27 @@ def test_a_first_line_of_keys_and_separators_dispatches(sandbox, capsys):
     assert fired(sandbox) == ["PPA-1424", "PPA-1425"]
 
 
-def test_work_and_prose_around_keys_warns_and_transitions_nothing(
+def test_work_and_prose_around_one_key_warns_and_transitions_nothing(
         sandbox, capsys):
     """PPA-1548 moved the sink: the warning is systemMessage, not stderr.
 
     stderr from a hook exiting 0 reaches the debug log only, so this warning
     was invisible to the operator it was written for. Everything else the case
-    asserts - exit 0, nothing fired - is unchanged.
+    asserts - exit 0, nothing fired - is unchanged. PPA-1784 narrowed it to one
+    key: two or more are refused, below.
     """
     install_stub(sandbox)
-    code, out = run(MALFORMED, capsys=capsys)
+    code, out = run(ONE_KEY_MALFORMED, capsys=capsys)
     assert code == 0
     assert fired(sandbox) == []
     assert json.loads(out)["systemMessage"].count("nothing was dispatched") == 1
 
 
-def test_the_warning_names_the_keys_and_the_residue(sandbox, capsys):
+def test_the_refusal_names_the_keys_and_the_residue(sandbox, capsys):
     install_stub(sandbox)
-    _code, out = run(MALFORMED, capsys=capsys)
-    err = json.loads(out)["systemMessage"]
+    code, _out = run(MALFORMED)
+    assert code == 2
+    err = capsys.readouterr().err
     # PPA-1470 Amendment 1. The keys half was asserted against the whole
     # message, and the message names the keys twice - once in the opening
     # sentence and again in the "make the first line" remedy. Deleting the
@@ -1559,13 +1570,112 @@ def test_a_first_line_with_no_keys_stays_silent(sandbox, capsys):
     assert fired(sandbox) == []
 
 
-def test_the_warning_never_blocks(sandbox, capsys):
+def test_the_one_key_warning_never_blocks(sandbox, capsys):
     """Exit 0, and no call into pt_transition.py."""
     install_stub(sandbox)
-    code, _ = run(MALFORMED)
+    code, _ = run(ONE_KEY_MALFORMED)
     capsys.readouterr()
     assert code == 0
     assert not hook.SCRIPT.with_name("fired.txt").exists()
+
+
+# --------------------------------------------------------------------------
+# Two or more keys on a mixed first line are refused - PPA-1784
+#
+# 01-OCT-2026: `PPA-1783 PPA-1776 PPA-1773 PPA-947 - run PPA-1783 first; the
+# weekly report waits on it` dispatched nothing, a 13m 45s session built all
+# four tickets, and all four stayed at To Do.
+
+INCIDENT = ("PPA-1783 PPA-1776 PPA-1773 PPA-947 - run PPA-1783 first; the "
+            "weekly report waits on it")
+
+
+def test_two_keys_plus_words_are_refused_and_nothing_is_transitioned(
+        sandbox, capsys):
+    install_stub(sandbox)
+
+    code, _ = run(MALFORMED)
+
+    assert code == 2
+    assert fired(sandbox) == []
+    assert capsys.readouterr().out == ""
+    record, = log_records()
+    assert record["reason"] == "malformed-dispatch"
+    assert record["first_line"] == MALFORMED
+
+
+def test_the_01_oct_incident_line_is_refused(sandbox, capsys):
+    install_stub(sandbox)
+
+    code, _ = run(INCIDENT, capsys=capsys)
+
+    assert code == 2
+    assert fired(sandbox) == []
+
+
+def test_the_refusal_quotes_the_words_and_gives_the_corrected_line(
+        sandbox, capsys):
+    install_stub(sandbox)
+
+    run(INCIDENT)
+    err = capsys.readouterr().err
+
+    assert "make the first line: PPA-1783, PPA-1776, PPA-1773, PPA-947" in err
+    assert "run  first; the weekly report waits on it" in err
+
+
+def test_the_refusal_says_how_to_ask_about_the_tickets_instead(sandbox, capsys):
+    install_stub(sandbox)
+
+    run(MALFORMED)
+    err = capsys.readouterr().err
+
+    assert ("To ask about these tickets rather than dispatch them, start the "
+            "message with a line that carries no ticket key.") in err
+
+
+def test_one_key_plus_words_warns_and_allows_without_the_refusal_sentence(
+        sandbox, capsys):
+    install_stub(sandbox)
+
+    code, out = run(ONE_KEY_MALFORMED, capsys=capsys)
+
+    assert code == 0
+    message = json.loads(out)["systemMessage"]
+    assert "nothing was dispatched" in message
+    assert "To ask about these tickets" not in message
+    assert capsys.readouterr().err == ""
+
+
+def test_two_mentions_of_the_same_key_are_one_key_and_only_warn(
+        sandbox, capsys):
+    install_stub(sandbox)
+
+    code, _ = run("PPA-1783 then PPA-1783 again", capsys=capsys)
+
+    assert code == 0
+
+
+def test_a_mixed_two_key_line_inside_a_pasted_wrapper_is_refused(
+        sandbox, capsys):
+    install_stub(sandbox)
+    pasted = f'<pasted_content id="4913">\n{INCIDENT}\n</pasted_content id="4913">'
+
+    code, _ = run(pasted, capsys=capsys)
+
+    assert code == 2
+    assert fired(sandbox) == []
+    assert log_records()[0]["first_line"] == INCIDENT
+
+
+def test_a_first_line_with_no_key_is_quiet_even_with_keys_below(
+        sandbox, capsys):
+    install_stub(sandbox)
+
+    code, out = run("Tell me about these.\nPPA-1, PPA-2 and PPA-3", capsys=capsys)
+
+    assert (code, out) == (0, "")
+    assert capsys.readouterr().err == ""
 
 
 def test_the_residue_and_the_qualifier_read_one_separator_set():
@@ -2951,3 +3061,114 @@ def test_the_description_rides_out_of_the_one_shared_read(monkeypatch):
     assert len(seen) == 1
     assert fields["description_adf"] == EDITS_SETTINGS
     assert REAL.edits_repo_settings(fields) is True
+
+
+# --------------------------------------------------------------------------
+# A Delegated ticket whose done list waits on its own merge - PPA-1769
+#
+# PPA-1747 conditions 1 and 6 and PPA-1767 conditions 1 and 2 could not be
+# reported MET by a session that posts its close-out before the merge.
+# --------------------------------------------------------------------------
+
+FIX = ("a delegated session posts its close-out before the merge and cannot "
+       "prove one - reword the condition to evidence on the ticket's own commit, "
+       "or tag it [conductor]")
+
+
+def done_list(*conditions):
+    return description(bullets(*conditions))
+
+
+def merge_wait(components, *conditions, prompt="PPA-9"):
+    fields = bar_ready(components, description(para("x")))
+    fields["dod_adf"] = done_list(*conditions)
+    return REAL.check_quality_bar(prompt, ["PPA-9"], shared={"PPA-9": fields})[0]
+
+
+def test_an_untagged_merged_to_main_condition_is_refused_and_named():
+    message = merge_wait(["EXA: Delegated"], "Reported.",
+                         "The change is merged to main.")
+
+    assert "PPA-9 condition 2: The change is merged to main." in message
+    assert "condition 1" not in message
+    assert FIX in message
+
+
+def test_a_machine_tagged_squash_merge_condition_is_refused_and_named():
+    message = merge_wait(["EXA: Delegated"],
+                         "[machine] A comment names the squash-merge commit.")
+
+    assert ("PPA-9 condition 1: [machine] A comment names the squash-merge "
+            "commit.") in message
+    assert FIX in message
+
+
+def test_every_matching_condition_is_named():
+    message = merge_wait(["EXA: Delegated"], "Merged to main.", "Fine.",
+                         "[machine] Names the Squash-Merge hash.")
+
+    assert "condition 1: Merged to main." in message
+    assert "condition 3: [machine] Names the Squash-Merge hash." in message
+
+
+@pytest.mark.parametrize("tag", ["[conductor]", "[observer]"])
+def test_a_conductor_or_observer_condition_is_not_refused(tag):
+    assert merge_wait(["EXA: Delegated"], f"{tag} Merged to main.") is None
+
+
+def test_a_guided_ticket_with_a_matching_condition_is_not_refused():
+    fields = bar_ready([], description(para("x")))
+    fields["dod_adf"] = done_list("[machine] Merged to main.")
+
+    assert REAL.merge_wait_conditions(fields) == []
+    assert "merge" not in (REAL.check_quality_bar(
+        "PPA-9", ["PPA-9"], shared={"PPA-9": fields})[0] or "")
+
+
+def test_a_delegated_ticket_with_no_matching_condition_is_admitted():
+    assert merge_wait(["EXA: Delegated"], "[machine] Tests pass.",
+                      "[conductor] Looks right.") is None
+
+
+def test_the_phrases_outside_the_definition_of_done_are_not_read():
+    fields = bar_ready(["EXA: Delegated"],
+                       description(para("Merged to main, then squash-merge it.")))
+    fields["dod_adf"] = done_list("[machine] Tests pass.")
+
+    assert REAL.merge_wait_conditions(fields) == []
+
+
+def test_naming_the_key_again_below_the_dispatch_line_is_the_opt_out_here_too():
+    assert merge_wait(["EXA: Delegated"], "Merged to main.",
+                      prompt="PPA-9\n\nPPA-9 is re-dispatched knowingly.") is None
+
+
+def test_the_refusal_and_a_bar_failure_are_reported_together_for_merge_wait():
+    fields = bar_ready(["EXA: Delegated"], description(para("x")))
+    fields["dod_adf"] = done_list("Merged to main.")
+    fields["dod"] = ""
+
+    message = REAL.check_quality_bar("PPA-9", ["PPA-9"], shared={"PPA-9": fields})[0]
+
+    assert "missing a non-empty Definition of Done" in message
+    assert "condition 1: Merged to main." in message
+
+
+def test_the_refusal_is_logged_with_the_condition_numbers():
+    merge_wait(["EXA: Delegated"], "Fine.", "Merged to main.")
+
+    records = [json.loads(line) for line in REAL.LOG.read_text().splitlines()]
+    record, = [r for r in records if r["reason"] == "merge-wait-refused"]
+    assert record["keys"] == ["PPA-9"]
+    assert record["conditions"] == {"PPA-9": [2]}
+
+
+def test_a_check_that_cannot_be_imported_warns_and_allows(monkeypatch, capsys):
+    """The merge-wait check reads the Bar's condition parser. Without it the
+    dispatch is let through with a note, never raised on."""
+    fields = bar_ready(["EXA: Delegated"], description(para("x")))
+    fields["dod_adf"] = done_list("Merged to main.")
+    monkeypatch.setitem(sys.modules, "check_dod_barred_artifacts", None)
+
+    assert REAL.merge_wait_conditions(fields) == []
+    assert "merge-wait check not run" in capsys.readouterr().out

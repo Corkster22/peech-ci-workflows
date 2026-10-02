@@ -5,6 +5,11 @@ When a turn ends, its elapsed time posts by itself as a Tempo worklog on the
 PPA or PEECHPMO ticket(s) the session's latest dispatch line names, so Sean's
 timesheet no longer waits on a manual top-up (PPA-1654, PPA-1676).
 
+``post_pending_turns.py`` is the SessionStart half (PPA-1774). It calls
+``sweep`` below for every earlier session, so the two hooks share one parser,
+one split, one rounding rule and one tag, and a turn posted by either is never
+posted twice.
+
 What it does, in order
 ----------------------
 1. Reads ``session_id`` and ``transcript_path`` from the hook input.
@@ -19,11 +24,10 @@ What it does, in order
 5. Splits each turn evenly across its keys, remainder seconds to the first, so
    the parts sum to the turn. A key's part counts as posted when its tag is in
    a worklog description on that key's issue. Each part not yet posted posts as
-   its own worklog with ``billableSeconds`` 0. Tempo refuses a worklog under 60
-   seconds, so a part under a minute is rounded up to exactly 60 on purpose,
-   by Sean's ruling (Decision 1B, Amendment 3), overstating it by at most 59
-   seconds. A longer part posts at its real length. Nothing is held across
-   turns and no worklog bundles several turns.
+   its own worklog with ``billableSeconds`` 0, rounded up to the next multiple
+   of 360 seconds, one tenth of an hour (``round_up``), overstating it by at
+   most 359 seconds. Nothing is held across turns and no worklog bundles
+   several turns.
 
 Why every row, not the latest
 -----------------------------
@@ -34,14 +38,23 @@ own Stop hook runs. Posting only the latest row would post one turn behind and
 lose a turn whenever a Stop did not fire, such as after an interrupt. Posting
 every row not yet tagged in Tempo catches up on the next Stop.
 
-The residual: a session's final turn posts only when a later Stop in that
-session finds its row, or when PPA-1756's catch-up script is re-run. Nothing
-fires after the last Stop, so without one of those that turn goes unposted.
+A session's final turn has no later Stop in that session, so it posts when the
+next session starts in one of the four Peech repositories (PPA-1774,
+``post_pending_turns.py``), or when PPA-1756's catch-up script is re-run.
 
 The tag is ``cc-turn:<session_id>:<uuid of the turn_duration row>``, carried as
 the whole description. PPA-1756's catch-up writes the same tag, so a part
 either one posted is never posted by the other. ``CUTOFF`` keeps turns that
 the untagged 23-SEP backfill already covered from posting twice.
+
+Alerts
+------
+Sean gets one Slack direct message, at most one per session per reason, when a
+Tempo post fails and when a turn carries no dispatch key (PPA-1774). The bot
+token is ``SLACK_BOT_TOKEN`` in the credentials file, and Sean's Slack user is
+found from the Jira email in the same file. ``ALERTS`` records what was sent. A
+Slack failure is written to ``LOG`` and nothing else: it never blocks a turn or
+a session start.
 
 Fail open
 ---------
@@ -67,6 +80,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -81,9 +95,12 @@ TEMPO = "https://api.tempo.io/4"
 ET = ZoneInfo("America/New_York")
 #: A turn ending before this was covered by the untagged 23-SEP backfill.
 CUTOFF = datetime(2026, 9, 24, tzinfo=ET)
-#: Tempo refuses a worklog under one minute with HTTP 400, so a shorter part is
-#: rounded up to this (Amendment 3, Decision 1B).
-MIN_SECONDS = 60
+#: Every post is a multiple of this, one tenth of an hour (PPA-1774 Amendment 2).
+#: Only Claude Code time is captured, so totals run low, and six-minute steps
+#: are the professional norm.
+ROUND_SECONDS = 360
+ALERTS = Path.home() / ".claude" / "pt-turn-worklog-alerts.json"
+SLACK = "https://slack.com/api"
 HTTP_TIMEOUT = 5
 #: Seconds this file spends on HTTP before it gives up. hooks.json allows more.
 DEADLINE = 25
@@ -200,6 +217,16 @@ def ended(row):
         return None
 
 
+def round_up(seconds):
+    """The next multiple of ``ROUND_SECONDS`` at or above ``seconds``.
+
+    1 to 360 posts as 360 and 361 to 720 as 720, so a post never understates
+    its part and overstates it by at most 359 seconds. A part of zero seconds
+    stays zero: the caller posts nothing for it. Both hooks post through this.
+    """
+    return -(-seconds // ROUND_SECONDS) * ROUND_SECONDS
+
+
 def split_seconds(total, count):
     """``count`` whole-second parts summing to ``total``, remainder first."""
     base, remainder = divmod(total, count)
@@ -266,33 +293,28 @@ class Poster:
         return any(turn_tag in d for d in self.descriptions[issue])
 
     def post(self, issue, part):
-        """One worklog for one part: a part under a minute rounded up to
-        exactly 60 seconds, a longer part at its real length."""
+        """One worklog for one part, its seconds rounded up by ``round_up``."""
         turn_tag, seconds, row = part
         start = (ended(row) - timedelta(milliseconds=row["durationMs"])).astimezone(ET)
         http_json("POST", f"{TEMPO}/worklogs", self.tempo, {
             "issueId": issue, "authorAccountId": SEAN,
             "startDate": start.strftime("%Y-%m-%d"), "startTime": start.strftime("%H:%M:%S"),
-            "timeSpentSeconds": max(seconds, MIN_SECONDS), "billableSeconds": 0,
+            "timeSpentSeconds": round_up(seconds), "billableSeconds": 0,
             "description": turn_tag})
 
     def post_key(self, key, parts):
         """Post this key's parts whose tag is not yet on its issue in Tempo.
 
-        Tempo refuses a worklog under 60 seconds, so a part under a minute
-        posts as 60 seconds, rounded up on purpose (Sean's ruling, Decision 1B,
-        Amendment 3): conductor time is not captured at all, so the timesheet
-        already runs short, and a small overage moves the total toward true.
-        Each post can overstate its part by at most 59 seconds. No other
-        rounding is done, a part of 60 seconds or more posts at its real
-        length, and a part of zero seconds posts nothing, which keeps the
-        59-second bound. Nothing is held across turns and no worklog bundles
-        several turns, so a later Stop posts only what Tempo does not yet show.
+        Each part posts rounded up to the next multiple of 360 seconds
+        (``round_up``), so a post overstates its part by at most 359 seconds,
+        and a part of zero seconds posts nothing. Nothing is held across turns
+        and no worklog bundles several turns, so a later Stop or session start
+        posts only what Tempo does not yet show.
 
         Whether a part is posted is read per tag and per issue (Amendment 2
         rule 3), so a later Stop finishes a multi-key turn that stopped
-        partway. The residual: with no later Stop, a multi-key turn left
-        partway at the end of a session stays partway.
+        partway. The next session start finishes one left partway at the end of
+        a session.
         """
         issue = self.issue_id(key)
         for part in parts:
@@ -304,11 +326,12 @@ def parts_by_key(session_id, todo):
     """Each key's (tag, seconds, row) parts of the turns it was dispatched on."""
     by_key = {}
     for row, keys in todo:
-        # PPA-1757 considered and dropped: Amendment 3 says "no other rounding",
-        # yet milliseconds become whole seconds here, half up, because Tempo's
-        # timeSpentSeconds is an integer and the remainder-to-first split needs
-        # one. It moves a turn by under half a second and predates Amendment 3,
-        # so nothing observable breaks if it is never changed.
+        # PPA-1757 considered and dropped: milliseconds become whole seconds
+        # here, half up, before the split and the 360-second rounding, because
+        # Tempo's timeSpentSeconds is an integer and the remainder-to-first
+        # split needs one. It moves a turn by under half a second, and the
+        # rounding that follows swallows it, so nothing observable breaks if it
+        # is never changed.
         total = (row["durationMs"] + 500) // 1000
         for key, seconds in zip(keys, split_seconds(total, len(keys))):
             if seconds > 0:
@@ -316,25 +339,108 @@ def parts_by_key(session_id, todo):
     return by_key
 
 
+def _alerted():
+    try:
+        return set(json.loads(ALERTS.read_text()))
+    except (OSError, ValueError):
+        return set()
+
+
+class Alerts:
+    """Slack direct messages to Sean, at most one per session per reason."""
+
+    def __init__(self, env):
+        self.env = env
+        self.headers = {"Authorization": f"Bearer {env.get('SLACK_BOT_TOKEN', '')}"}
+        self.channel = None
+
+    def _call(self, method, path, body=None):
+        reply = http_json(method, f"{SLACK}/{path}", self.headers, body)
+        if not reply.get("ok"):
+            raise RuntimeError(f"Slack {path}: {reply.get('error', 'not ok')}")
+        return reply
+
+    def send(self, session_id, reason, row, detail):
+        """Send one message unless this session already had one for ``reason``.
+
+        Never raises. A failure is logged and the message is retried at the next
+        hook run, because it is only recorded as sent once Slack accepted it.
+        """
+        sent_key = f"{session_id}|{reason}"
+        if sent_key in _alerted():
+            return
+        try:
+            if self.channel is None:
+                user = self._call("GET", "users.lookupByEmail?email=" + urllib.parse.quote(
+                    self.env["JIRA_EMAIL"]))["user"]["id"]
+                self.channel = self._call("POST", "conversations.open",
+                                          {"users": user})["channel"]["id"]
+            seconds = (row["durationMs"] + 500) // 1000
+            self._call("POST", "chat.postMessage", {"channel": self.channel, "text": (
+                f"Claude Code time log: {reason}.\n"
+                f"Session {session_id}, turn ended "
+                f"{ended(row).astimezone(ET):%Y-%m-%d %H:%M} ET, "
+                f"length {seconds // 60}m {seconds % 60}s.\n{detail}").rstrip()})
+            ALERTS.parent.mkdir(parents=True, exist_ok=True)
+            ALERTS.write_text(json.dumps(sorted(_alerted() | {sent_key})))
+        except Exception as exc:  # noqa: BLE001 - an alert never blocks a turn
+            log(tag(session_id, row.get("uuid", "?")), f"alert not sent: {type(exc).__name__}: {exc}")
+
+
+NO_KEY = "a turn has no dispatch key and nothing was posted"
+
+
+def windowed(transcript_path):
+    """Every (turn_duration row, keys in force) that ended on or after CUTOFF."""
+    return [(row, keys) for row, keys in turns(transcript_path)
+            if (when := ended(row)) and when >= CUTOFF]
+
+
+def needs_work(session_id, marked):
+    """True when a session has a turn to post, or a no-key alert still unsent.
+
+    Checked before any HTTP, so a Stop in a session with nothing to do, or whose
+    ticketless turn was already reported, makes no request.
+    """
+    return any(keys for _, keys in marked) or (
+        bool(marked) and f"{session_id}|{NO_KEY}" not in _alerted())
+
+
+def sweep(poster, alerts, session_id, marked):
+    """Post every turn in ``marked`` that Tempo does not yet show, and alert.
+
+    ``poster`` and ``alerts`` are built once by the caller, so a start that
+    sweeps many sessions asks Jira and Slack for each lookup once. A network or
+    timeout failure raises, ending the caller's run; the next run retries.
+    """
+    if (nokey := next((row for row, keys in marked if not keys), None)) is not None:
+        alerts.send(session_id, NO_KEY, nokey,
+                    "Put the ticket keys on the first line of the next prompt.")
+    todo = [(row, keys) for row, keys in marked if keys]
+    for key, parts in parts_by_key(session_id, todo).items():
+        try:
+            poster.post_key(key, parts)
+        except Exception as exc:  # noqa: BLE001 - this key's own data, or the network
+            alerts.send(session_id, "a Tempo post failed", parts[0][2],
+                        f"{key}: {type(exc).__name__}: {exc}")
+            if isinstance(exc, OSError):
+                raise  # network or timeout: end the run; the caller logs it
+            log(parts[0][0], f"{type(exc).__name__}: {exc}")
+
+
 def main():
     turn = "unknown"
     try:
         payload = json.load(sys.stdin)
         session_id = turn = payload["session_id"]
-        todo = [(row, keys) for row, keys in turns(payload["transcript_path"])
-                if keys and (when := ended(row)) and when >= CUTOFF]
-        if todo:
-            turn = tag(session_id, todo[0][0]["uuid"])
-            poster = Poster(load_env(CREDENTIALS))
+        marked = windowed(payload["transcript_path"])
+        if needs_work(session_id, marked):
+            turn = tag(session_id, next(
+                (r for r, k in marked if k), marked[0][0])["uuid"])
+            env = load_env(CREDENTIALS)
+            poster = Poster(env)
             if poster.is_sean():
-                for key, parts in parts_by_key(session_id, todo).items():
-                    turn = parts[0][0]
-                    try:
-                        poster.post_key(key, parts)
-                    except OSError:
-                        raise  # network or timeout: end the run, the next Stop retries
-                    except Exception as exc:  # noqa: BLE001 - this key's own data
-                        log(turn, f"{type(exc).__name__}: {exc}")
+                sweep(poster, Alerts(env), session_id, marked)
     except Exception as exc:  # noqa: BLE001 - fail open on every path
         log(turn, f"{type(exc).__name__}: {exc}")
     return 0

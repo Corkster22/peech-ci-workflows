@@ -25,7 +25,10 @@ Exit 2 is the only code that blocks a UserPromptSubmit hook. Nothing in the
 transition half can reach it, and that is unchanged. Three admission checks
 below can, each on a positive answer from Jira and on nothing else: the
 repository-match check (PPA-1465), the dispatch-completeness check (PPA-1418)
-and the Ticket Quality Bar check (PPA-1427). The deployed-skill drift report
+and the Ticket Quality Bar check (PPA-1427), which also carries the
+settings-file rule (PPA-1758) and the merge-wait rule (PPA-1769). One refusal
+reads the prompt alone and asks Jira nothing: a first line carrying two or
+more keys and other words (PPA-1784). The deployed-skill drift report
 (PPA-1470) is not one of them - it warns. Every other path in this file
 returns 0.
 
@@ -76,13 +79,15 @@ wrote one each, inside the check that raises them, so nothing was added there:
 
   ``unreadable-payload``          stdin was not JSON
   ``no-dispatch``                 the leading line named no key
-  ``malformed-dispatch``          it named keys and did not qualify
+  ``malformed-dispatch``          it named keys and did not qualify; exit 2
+                                  at two or more keys, a warning at one
   ``dispatch-for-another-repository`` exit 2, the session is elsewhere
   ``dispatch-spans-repositories``     exit 2, the keys name two remotes
   ``dispatch-incomplete``             exit 2, a dispatchable ticket is unnamed
   ``dispatch-mixed-work-types``       exit 2, one line names both work types
   ``bar-failed``                      exit 2, a ticket fails the Bar
-  ``already-settled``             every dispatched key settled earlier
+  ``merge-wait-refused``              exit 2, a done list waits on its merge
+  ``already-settled``           every dispatched key settled earlier
   ``no-script``                   ``pt_transition.py`` is not on disk
   ``subprocess-failed``           it could not be run
   ``nonzero-exit``                it ran and did not settle every key
@@ -365,6 +370,24 @@ neither is ``~/.claude/settings.json``, the Mac's user settings. The refusal
 shares the Bar's opt-out: naming the key again in prose lets it through, which
 a ticket whose Change section describes this very check needs.
 
+A done list that waits on its own merge is not Delegated work — PPA-1769
+--------------------------------------------------------------------------
+A delegated session posts its Jira close-out before its pull request merges,
+so a Definition of Done condition that needs the change merged to main, or a
+comment naming the squash-merge commit, can never be reported MET by the
+session. The merge close-out workflow then holds or parks the ticket and the
+conductor closes it by hand: PPA-1747 and PPA-1767 on 01-OCT-2026. pt-backlog
+§ Story Creation Checklist item 6 already says such a condition is a conductor
+condition; this check enforces it at dispatch.
+
+A Delegated ticket is refused when a condition that is untagged or tagged
+``[machine]`` contains "merged to main" or "squash-merge", in any case. A
+condition tagged ``[conductor]`` or ``[observer]`` is not a match, a Guided or
+Discovery ticket is never a match, and the phrases are read in the Definition
+of Done only, never in the description. The refusal numbers each condition as
+the field lists them and shares the Bar's opt-out. Other conditions a session
+cannot evidence before its merge, such as a live deploy, are not addressed.
+
 Deployed skills drift, and the session binds one copy — PPA-1470
 -----------------------------------------------------------------
 Amendment 2, as corrected by the conductor on 16-SEP-2026. A dispatch is only
@@ -428,8 +451,24 @@ record. Traced live against this file on 16-SEP-2026: ``dispatched_keys``
 returns ``[]``.
 
 That case now prints one warning naming the keys, the residue that
-disqualified the line, and the qualifying form. It warns and never blocks: the
-intent behind a malformed line is the one thing this hook must not guess at.
+disqualified the line, and the qualifying form. It warns and does not guess at
+the intent behind a malformed line.
+
+**Two or more keys refuse — PPA-1784.** The warning was not enough. On
+01-OCT-2026 the line ``PPA-1783 PPA-1776 PPA-1773 PPA-947 - run PPA-1783 first;
+the weekly report waits on it`` dispatched nothing, a 13m 45s session built all
+four tickets, all four stayed at To Do, and the Definition of Done gate refused
+at stop because it had nothing to grade. A first line that carries two or more
+distinct keys and anything beside keys and separators now exits 2 with the
+warning's text plus one sentence: to ask about the tickets rather than dispatch
+them, start the message with a line that carries no ticket key. Nothing is
+transitioned. The log record is unchanged, reason ``malformed-dispatch`` with
+the first line.
+
+**The threshold is two because one key is ordinary conversation.** A line such
+as ``PPA-1783 apply output below`` is a follow-up inside a working session, and
+refusing it would block routine turns. It keeps the PPA-1434 behavior: warn and
+allow. Every recorded incident carried two or more keys.
 
 **The warning goes through ``warn()`` — PPA-1548.** It went to stderr, on the
 reasoning that it describes the prompt the operator just typed rather than a
@@ -577,6 +616,15 @@ def first_nonblank_line(prompt):
         if line:
             return line
     return ""
+
+
+#: PPA-1784. The first line carrying this many distinct keys, and anything
+#: besides keys and separators, is refused rather than warned about.
+REFUSE_AT_KEYS = 2
+
+#: What the refusal adds to the warning's text.
+ASK_INSTEAD = ("To ask about these tickets rather than dispatch them, start the "
+               "message with a line that carries no ticket key.")
 
 
 def malformed_dispatch_warning(prompt):
@@ -1304,6 +1352,51 @@ def settings_block_message(keys):
     )
 
 
+#: PPA-1769. The two phrases a delegated session cannot evidence, because its
+#: close-out is posted before the merge.
+_MERGE_WAIT_RE = re.compile(r"merged to main|squash-merge", re.IGNORECASE)
+_EXEMPT_CLASS_RE = re.compile(r"^\[(conductor|observer)\]", re.IGNORECASE)
+
+MERGE_WAIT_FIX = ("a delegated session posts its close-out before the merge and "
+                  "cannot prove one - reword the condition to evidence on the "
+                  "ticket's own commit, or tag it [conductor]")
+
+
+def merge_wait_conditions(fields):
+    """[(number, text)] of the conditions in a Delegated ticket's Definition of
+    Done that wait on their own merge. A Guided ticket is never a match.
+
+    Numbered as the field lists them, from 1. A condition tagged ``[conductor]``
+    or ``[observer]`` is exempt; an untagged one and a ``[machine]`` one are not.
+    """
+    if work_type_of(fields["components"]) != "Delegated":
+        return []
+    # Imported here, as barred_artifacts() does: the Bar's check ships beside
+    # this file, and a copy without it must warn and allow rather than raise.
+    sys.path.insert(0, str(PLUGIN / "scripts"))
+    try:
+        from check_dod_barred_artifacts import conditions_from_adf  # noqa: PLC0415
+        conditions = conditions_from_adf(fields.get("dod_adf"))
+    except Exception as exc:  # noqa: BLE001 - every read failure warns, allows
+        log("merge-wait-check-failed", [], error=repr(exc))
+        warn(f"merge-wait check not run - {exc}")
+        return []
+    return [(number, text) for number, text in enumerate(conditions, start=1)
+            if _MERGE_WAIT_RE.search(text) and not _EXEMPT_CLASS_RE.match(text)]
+
+
+def merge_wait_block_message(waiting):
+    lines = "\n".join(f"  {key} condition {number}: {text}"
+                      for key, found in waiting.items() for number, text in found)
+    return (
+        "Dispatch carries a Delegated ticket whose Definition of Done waits on "
+        "its own merge.\n\n"
+        f"{lines}\n\n"
+        f"{MERGE_WAIT_FIX}. Or name the key again in the prompt text below the "
+        "dispatch line - a second mention is the opt-out and lets this through."
+    )
+
+
 def check_quality_bar(prompt, keys, shared=None):
     """(block message or None, {key: live status}) for the dispatched keys.
 
@@ -1336,8 +1429,12 @@ def check_quality_bar(prompt, keys, shared=None):
                if key not in waived and key in fields
                and edits_repo_settings(fields[key])]
 
+    waiting = {key: found for key in keys
+               if key not in waived and key in fields
+               and (found := merge_wait_conditions(fields[key]))}
+
     statuses = {k: v["status"] for k, v in fields.items()}
-    if not failures and not guarded:
+    if not failures and not guarded and not waiting:
         return None, statuses
 
     messages = []
@@ -1347,6 +1444,11 @@ def check_quality_bar(prompt, keys, shared=None):
     if guarded:
         log("settings-edit-refused", guarded)
         messages.append(settings_block_message(guarded))
+    if waiting:
+        log("merge-wait-refused", list(waiting),
+            conditions={key: [number for number, _ in found]
+                        for key, found in waiting.items()})
+        messages.append(merge_wait_block_message(waiting))
     return "\n\n".join(messages), statuses
 
 
@@ -1867,8 +1969,9 @@ def main():
     """Never raises. Returns 2 only when an admission check refuses, else 0.
 
     See "The transition never blocks" above: every failure path returns 0, and
-    the three refusals are the repository-match check, the completeness check
-    and the Bar check each answering positively.
+    the refusals are the repository-match check, the completeness check and the
+    Bar check each answering positively, and the malformed first line carrying
+    two or more keys (PPA-1784).
 
     The outer guard is what makes "any exception is logged" true rather than
     aspirational: an unexpected failure below would otherwise leave the same
@@ -1897,11 +2000,11 @@ def _transition():
         # completeness. See "A dispatched key is not a mentioned one" above.
         #
         # A first line carrying keys that still failed the qualifier is the
-        # third case PPA-1418 did not reason about, and it warns - see "A
-        # malformed dispatch is not a silent one" above. It warns and returns
-        # 0: nothing is transitioned and nothing is blocked, because the
-        # intent behind a malformed line is exactly what this hook must not
-        # guess at.
+        # third case PPA-1418 did not reason about - see "A malformed dispatch
+        # is not a silent one" above. One key warns and returns 0: it is
+        # ordinary conversation. Two or more refuse with exit 2 (PPA-1784),
+        # because the session would build with every ticket left at To Do.
+        # Nothing is transitioned either way.
         #
         # PPA-1548: both readings record, and the record carries the line the
         # resolver read, so the next occurrence names its own cause instead of
@@ -1912,7 +2015,11 @@ def _transition():
         line = first_nonblank_line(prompt)
         malformed = malformed_dispatch_warning(prompt)
         if malformed:
-            log("malformed-dispatch", keys_in(line), first_line=line)
+            mentioned = keys_in(line)
+            log("malformed-dispatch", mentioned, first_line=line)
+            if len(mentioned) >= REFUSE_AT_KEYS:
+                print(f"{malformed}\n\n{ASK_INSTEAD}", file=sys.stderr)
+                return 2
             warn(malformed)
         else:
             log("no-dispatch", [], first_line=line)
