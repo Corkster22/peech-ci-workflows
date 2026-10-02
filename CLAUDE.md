@@ -28,6 +28,11 @@ PeechTech-Framework-SharedAutomationRouting in peech-pmo-automation.
 | `scripts/pr_merge_close_out.py` | The close-out rules. Every rule the close-out applies lives here, not in YAML. |
 | `scripts/pt_transition.py` | Moves PPA keys to a named status, one live hop at a time. |
 | `scripts/tests/` | pytest coverage for both scripts. |
+| `scripts/repo_settings.py` | Checks, or with `--apply` writes, every repository's GitHub branch protection and merge settings from `repo-settings.json`. |
+| `repo-settings.json` | The single source for every repository's GitHub settings. |
+| `plugins/pt-automation-hooks/` | The shared Claude Code hooks plugin: 10 hooks under `hooks/`, `plugins/pt-automation-hooks/scripts/check_dod_barred_artifacts.py`, and its pytest suite under `tests/`. |
+| `.claude-plugin/marketplace.json` | The `peech-ci` plugin marketplace that publishes the hooks plugin. |
+| `.claude/settings.json` | This repository's Claude Code settings: enables the hooks plugin from the `peech-ci` marketplace and allows `git add`, `commit` and `push`. |
 
 The two scripts have registered copies in the sibling repositories, listed in
 peech-pmo-automation's cross-repository copy register. An edit here is half a
@@ -84,7 +89,10 @@ to the credential file `scripts/pt_transition.py` reads. Callers pass
 
 ## Testing
 
-Run from the repository root: `python3 -m pytest scripts/`
+CI (`pytest.yml`) runs two suites. Run both before you push.
+
+- Scripts suite, from the repository root: `python3 -m pytest scripts/`
+- Hooks plugin suite, from `plugins/pt-automation-hooks`: `python3 -m pytest tests/`. The hooks read `scripts/` from the clone at `~/Documents/Claude-Projects/peech-ci-workflows`, so run it from that clone or link your checkout there.
 
 ## Common Misreads
 
