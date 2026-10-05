@@ -131,6 +131,8 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(hook, "repo_components_of",
                         lambda keys, **kw: dict.fromkeys(keys, "REPO: peech-skills"))
     monkeypatch.setattr(hook, "dispatchable_set", lambda component, **kw: [])
+    # PPA-1829 added the PEECHPMO half of the same check; same reasoning.
+    monkeypatch.setattr(hook, "peechpmo_dispatchable_set", lambda **kw: [])
     # PPA-1716 made the completeness check read each key's work type. The
     # fixture keys below are invented, so none has one and the set stays whole.
     monkeypatch.setattr(hook, "work_types_of", lambda keys, **kw: {})
@@ -3212,3 +3214,86 @@ def test_two_ppa_keys_and_a_peechpmo_key_are_not_refused(sandbox, capsys):
 def test_a_prefix_neither_ppa_nor_peechpmo_is_still_no_dispatch():
     assert hook.dispatched_keys("AISD2026-5") == []
     assert hook.keys_in("XPEECHPMO-5") == []
+
+
+# --------------------------------------------------------------------------
+# PPA-1829 - a PEECHPMO key is measured against the PEECHPMO backlog
+# --------------------------------------------------------------------------
+
+REAL_PEECHPMO_SET = hook.peechpmo_dispatchable_set
+PEECHPMO_JQL = ('project = PEECHPMO AND component = "JAMF" '
+                'AND component = "EXA: Delegated" AND statusCategory != Done')
+
+
+def completeness_probe(monkeypatch, pmo_backlog, ppa_backlog=()):
+    """Stub the reads and record every query the check builds.
+
+    Returns ``(ppa_queries, pmo_queries)``: the PPA set is recorded as the
+    JQL ``dispatchable_jql`` builds for the component asked, the PEECHPMO set
+    as the JQL decoded from the search request.
+    """
+    ppa_queries, pmo_queries = [], []
+
+    def ppa_set(component, work_type=None, **kw):
+        ppa_queries.append(hook.dispatchable_jql(component, work_type))
+        return list(ppa_backlog)
+
+    def jira_get(path, timeout=None):
+        pmo_queries.append(urllib.parse.parse_qs(
+            urllib.parse.urlparse(path).query)["jql"][0])
+        return {"issues": [{"key": k} for k in pmo_backlog]}
+
+    monkeypatch.setattr(hook, "repo_components_of",
+                        lambda keys, **kw: dict.fromkeys(keys, "REPO: peech-skills"))
+    monkeypatch.setattr(hook, "work_types_of", lambda keys, **kw: {})
+    monkeypatch.setattr(hook, "dispatchable_set", ppa_set)
+    monkeypatch.setattr(hook, "_jira_get", jira_get)
+    # The sandbox stubs the PEECHPMO read; this probe is about the real one.
+    monkeypatch.setattr(hook, "peechpmo_dispatchable_set",
+                        REAL_PEECHPMO_SET)
+    return ppa_queries, pmo_queries
+
+
+def test_a_ppa_only_line_builds_the_ppa_query_and_never_the_peechpmo_one(
+        sandbox, monkeypatch):
+    ppa_queries, pmo_queries = completeness_probe(monkeypatch, ["PEECHPMO-9"],
+                                                  ["PPA-2"])
+
+    message = hook.check_dispatch_complete("PPA-1", ["PPA-1"])
+
+    assert ppa_queries == [
+        'project = PPA AND status in ("To Do", "Reopened") AND component in '
+        '("EXA: Delegated", "EXA: Delegated Discovery") '
+        'AND component = "REPO: peech-skills"']
+    assert pmo_queries == []
+    assert "named nowhere in this prompt: PPA-2" in message
+    assert "PEECHPMO" not in message
+
+
+def test_a_peechpmo_only_line_builds_the_peechpmo_query(sandbox, monkeypatch):
+    ppa_queries, pmo_queries = completeness_probe(
+        monkeypatch, ["PEECHPMO-1", "PEECHPMO-2"])
+
+    message = hook.check_dispatch_complete("PEECHPMO-1", ["PEECHPMO-1"])
+
+    assert pmo_queries == [PEECHPMO_JQL]
+    assert ppa_queries == []
+    assert "PEECHPMO (Mac Fleet)" in message
+    assert "named nowhere in this prompt: PEECHPMO-2" in message
+
+
+def test_a_mixed_line_builds_both_and_reports_each_under_its_own_project(
+        sandbox, monkeypatch):
+    ppa_queries, pmo_queries = completeness_probe(
+        monkeypatch, ["PEECHPMO-1", "PEECHPMO-2"], ["PPA-1", "PPA-2"])
+
+    message = hook.check_dispatch_complete(
+        "PPA-1, PEECHPMO-1", ["PPA-1", "PEECHPMO-1"])
+
+    assert len(ppa_queries) == 1 and pmo_queries == [PEECHPMO_JQL]
+    ppa_part, pmo_part = message.split("Dispatch is incomplete for PEECHPMO")
+    assert "Dispatch is incomplete for REPO: peech-skills" in ppa_part
+    assert "named nowhere in this prompt: PPA-2" in ppa_part
+    assert "PEECHPMO-2" not in ppa_part
+    assert "named nowhere in this prompt: PEECHPMO-2" in pmo_part
+    assert "PPA-2" not in pmo_part

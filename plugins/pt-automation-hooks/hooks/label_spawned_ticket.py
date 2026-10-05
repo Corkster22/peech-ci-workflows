@@ -46,7 +46,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from transition_on_prompt import PREFIX_ALT, TICKET_PREFIXES  # noqa: E402
-TOOL = "mcp__atlassian-rovo__createJiraIssue"
+TOOL = "mcp__atlassian__createJiraIssue"
 LOG = Path.home() / ".claude" / "pt-spawn-label-hook.log"
 LABEL = "spawned"
 JIRA_TIMEOUT = 10
