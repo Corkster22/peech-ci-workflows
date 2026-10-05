@@ -922,6 +922,30 @@ def dispatchable_jql(component, work_type=None):
             f'AND component = "{component}"')
 
 
+#: The PEECHPMO half of CLAUDE.md Jamf routing rule 7 (PPA-1829). PEECHPMO
+#: has its own copy of the Delegated component, and the Jamf tickets are
+#: found by JAMF. The rule asks for statusCategory != Done rather than the
+#: PPA statuses, so an In Progress Mac Fleet ticket is still demanded.
+JAMF_COMPONENT = "JAMF"
+PEECHPMO_DELEGATED = "EXA: Delegated"
+
+
+def peechpmo_dispatchable_jql():
+    """The Mac Fleet dispatchable set. No repository filter applies: not every
+    PEECHPMO ticket carries a ``REPO:`` component, and the rule names none."""
+    return (f'project = PEECHPMO AND component = "{JAMF_COMPONENT}" '
+            f'AND component = "{PEECHPMO_DELEGATED}" '
+            "AND statusCategory != Done")
+
+
+def peechpmo_dispatchable_set(timeout=JIRA_TIMEOUT):
+    """Every open dispatchable PEECHPMO key, read live from Jira. Raises."""
+    query = urllib.parse.urlencode(
+        {"jql": peechpmo_dispatchable_jql(), "fields": "key", "maxResults": 100})
+    data = _jira_get(f"/search/jql?{query}", timeout)
+    return [issue["key"].upper() for issue in data.get("issues") or []]
+
+
 #: A blocker that has landed. Anything else still holds the ticket it blocks.
 #: Read as names rather than IDs, per the repository's own rule against acting
 #: on a remembered transition or status ID.
@@ -1793,7 +1817,7 @@ def mixed_work_types_message(by_type):
     )
 
 
-def check_dispatch_complete(prompt, keys, fields=None):
+def _check_ppa_complete(prompt, keys, fields=None):
     """The block message when this dispatch is wrong, else None.
 
     ``keys`` are the dispatched keys - the leading line's, not every key in the
@@ -1898,6 +1922,43 @@ def check_dispatch_complete(prompt, keys, fields=None):
     log("dispatch-incomplete", missing, component=scope.component,
         work_type=work_type, dispatchable=dispatchable)
     return block_message(missing, scope.component, work_type)
+
+
+def check_peechpmo_complete(prompt):
+    """The block message when the prompt omits a dispatchable PEECHPMO key.
+
+    A Jira failure warns and allows, as the PPA half does.
+    """
+    try:
+        dispatchable = peechpmo_dispatchable_set()
+    except Exception as exc:  # noqa: BLE001 - every read failure warns and allows
+        log("peechpmo-dispatchable-read-failed", [], error=repr(exc))
+        warn(f"dispatch completeness not checked for PEECHPMO - {exc}")
+        return None
+    missing = missing_from(dispatchable, keys_in(prompt))
+    if not missing:
+        return None
+    log("dispatch-incomplete", missing, component="PEECHPMO",
+        dispatchable=dispatchable)
+    return block_message(missing, "PEECHPMO (Mac Fleet)")
+
+
+def check_dispatch_complete(prompt, keys, fields=None):
+    """The block message when this dispatch is wrong, else None (PPA-1829).
+
+    Each key is measured against its own project's open set. The PPA keys go
+    through ``_check_ppa_complete`` exactly as before; the PEECHPMO keys are
+    measured against the PEECHPMO half of Jamf rule 7. A mixed line runs both
+    and reports each set's missing keys under its own project.
+    """
+    pmo = [k for k in keys if k.upper().startswith("PEECHPMO-")]
+    if not pmo:
+        return _check_ppa_complete(prompt, keys, fields=fields)
+    ppa = [k for k in keys if k not in pmo]
+    messages = [m for m in (
+        _check_ppa_complete(prompt, ppa, fields=fields) if ppa else None,
+        check_peechpmo_complete(prompt)) if m]
+    return "\n\n".join(messages) or None
 
 
 def dispatch_set_lines(repository):

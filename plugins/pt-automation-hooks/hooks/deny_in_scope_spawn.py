@@ -72,10 +72,11 @@ the operator through the session, which that reason tells to stop and ask.
 
 The tool name
 -------------
-``mcp__atlassian-rovo__createJiraIssue``, read from the session's own tool
-list on 22-SEP-2026. A matcher on a name that does not exist is a gate that
-never fires and reports nothing, so the settings matcher and ``TOOL`` below
-are the same string and a test holds them together.
+``mcp__atlassian__createJiraIssue``, read from the session's own tool
+list on 22-SEP-2026 and re-read on 05-OCT-2026 after the server was renamed.
+A matcher on a name that does not exist is a gate that never fires and
+reports nothing, so the settings matcher and ``TOOL`` below are the same
+string and a test holds them together.
 """
 
 from __future__ import annotations
@@ -98,7 +99,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from refresh_ci_workflows import CLONE_SCRIPTS  # noqa: E402
 from transition_on_prompt import TICKET_PREFIXES  # noqa: E402
 
-TOOL = "mcp__atlassian-rovo__createJiraIssue"
+TOOL = "mcp__atlassian__createJiraIssue"
 LOG = Path.home() / ".claude" / "pt-spawn-control-hook.log"
 DOD_FIELD = "customfield_10767"
 JIRA_TIMEOUT = 10

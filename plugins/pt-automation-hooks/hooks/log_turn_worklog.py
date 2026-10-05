@@ -21,8 +21,9 @@ What it does, in order
    note (Amendment 1), the older "Execute PPA-XXX." form, or the same line
    beneath a ``<pasted_content>`` tag. A turn with no key is skipped.
 4. Posts only when the Jira identity in the credentials file is Sean's.
-5. Splits each turn evenly across its keys, remainder seconds to the first, so
-   the parts sum to the turn. A key's part counts as posted when its tag is in
+5. Splits each turn evenly across the keys it is charged to (PPA-1802: the
+   dispatch keys a commit message or a Jira write in the turn names, else
+   all), remainder seconds to the first, so the parts sum to the turn. A key's part counts as posted when its tag is in
    a worklog description on that key's issue. Each part not yet posted posts as
    its own worklog with ``billableSeconds`` 0, rounded up to the next multiple
    of 360 seconds, one tenth of an hour (``round_up``), overstating it by at
@@ -187,9 +188,76 @@ def _prompt_text(row):
     return ""
 
 
+#: A Jira write names the tool it ran through. ``executeWrite`` and
+#: ``executeDestructive`` carry the generic operations, such as a link; the
+#: reads (``getJiraIssue``, ``executeRead``, a search) are deliberately absent,
+#: because a turn reads context tickets it does not work (PPA-1802).
+_JIRA_WRITES = {"addOrEditJiraIssueComment", "editJiraIssue",
+                "transitionJiraIssue", "executeWrite", "executeDestructive"}
+_JIRA_TOOL_RE = re.compile(r"^mcp__atlassian(?:-rovo)?__(\w+)$")
+_GIT_COMMIT_RE = re.compile(r"\bgit\s+(?:-\S+\s+)*commit\b")
+_MESSAGE_ARG_RE = re.compile(r"""(?:-m|--message)[\s=]*(?:"((?:[^"\\]|\\.)*)"|'([^']*)')""")
+_HEREDOC_RE = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?\n(.*?)\n\s*\1\b", re.DOTALL)
+
+
+def commit_message_text(command):
+    """The commit message text of each ``git commit`` in a shell command.
+
+    Only the message counts: a branch name in the same command, such as a
+    ``git push origin ppa-1802`` chained after the commit, is not evidence
+    (PPA-1802). The message is the ``-m`` argument or a heredoc body.
+    """
+    text = []
+    for found in _GIT_COMMIT_RE.finditer(command):
+        rest = command[found.end():]
+        text += [a or b for a, b in _MESSAGE_ARG_RE.findall(rest)]
+        text += [body for _, body in _HEREDOC_RE.findall(rest)]
+    return "\n".join(text)
+
+
+def evidence_keys(calls, errored):
+    """(commit keys, Jira-write keys) a turn's tool calls name, uppercased.
+
+    ``calls`` are the turn's ``tool_use`` blocks and ``errored`` the ids whose
+    result was an error: a commit or a write that failed left no evidence.
+    """
+    commits, writes = [], []
+    for call in calls:
+        if call.get("id") in errored:
+            continue
+        name, args = call.get("name"), call.get("input")
+        if not isinstance(args, dict):
+            continue
+        if name == "Bash" and isinstance(args.get("command"), str):
+            commits += _KEY_RE.findall(commit_message_text(args["command"]))
+        elif (m := _JIRA_TOOL_RE.match(name or "")) and m.group(1) in _JIRA_WRITES:
+            writes += _KEY_RE.findall(json.dumps(args))
+    return ([k.upper() for k in commits], [k.upper() for k in writes])
+
+
+def charged_keys(dispatch, calls, errored):
+    """The dispatch keys a turn's time is charged to (PPA-1802, Decision 3A).
+
+    The first tier that names at least one dispatch key wins: a key in a commit
+    message, then a key in a Jira write. Otherwise every dispatch key, which is
+    the even split PPA-1757 shipped. Keys outside the dispatch set count for
+    nothing, and the order is the dispatch's, so the remainder second goes to
+    the first.
+    """
+    for named in evidence_keys(calls, errored):
+        if hit := [k for k in dispatch if k in named]:
+            return hit
+    return dispatch
+
+
 def turns(transcript_path):
-    """Every (turn_duration row, the keys in force at it), in file order."""
+    """Every (turn_duration row, the keys it is charged to), in file order.
+
+    The keys are the latest dispatch line's, narrowed to the ones the turn's own
+    tool calls left evidence on (``charged_keys``).
+    """
     keys, found = [], []
+    calls, errored = [], set()
     for line in Path(transcript_path).read_text(errors="ignore").splitlines():
         try:
             row = json.loads(line)
@@ -198,9 +266,18 @@ def turns(transcript_path):
         if not isinstance(row, dict):
             continue
         if row.get("type") == "system" and row.get("subtype") == "turn_duration":
-            found.append((row, keys))
+            found.append((row, charged_keys(keys, calls, errored)))
+            calls, errored = [], set()
         else:
             keys = dispatch_keys(_prompt_text(row)) or keys
+            content = (row.get("message") or {}).get("content")
+            for part in content if isinstance(content, list) else []:
+                if not isinstance(part, dict):
+                    continue
+                if row.get("type") == "assistant" and part.get("type") == "tool_use":
+                    calls.append(part)
+                elif part.get("type") == "tool_result" and part.get("is_error"):
+                    errored.add(part.get("tool_use_id"))
     return found
 
 

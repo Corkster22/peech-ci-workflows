@@ -13,6 +13,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -690,3 +691,122 @@ def test_no_code_path_exits_with_code_2():
     source = HOOK.read_text()
     assert not re.search(r"exit\s*\(\s*2\b|SystemExit\s*\(\s*2\b|exit\s+2\b|return\s+2\b", source)
     assert "os._exit" not in source
+
+
+# --- PPA-1802: charge a turn to the tickets its tool calls left evidence on --
+
+
+def call(tool, id="t1", **args):
+    return {"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "id": id, "name": tool, "input": args}]}}
+
+
+def bash(command, id="t1"):
+    return call("Bash", id=id, command=command)
+
+
+def jira(tool, id="t1", **args):
+    return call(f"mcp__atlassian__{tool}", id=id, **args)
+
+
+def turns_of(rows):
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+        f.write("\n".join(json.dumps(r) for r in rows) + "\n")
+    try:
+        return hook.turns(f.name)
+    finally:
+        Path(f.name).unlink()
+
+
+def charged(rows, dispatch="PPA-1, PPA-2, PPA-3"):
+    """The keys the single turn in ``rows`` is charged to."""
+    return turns_of([prompt(dispatch), *rows, TURN])[0][1]
+
+
+def test_commit_evidence_wins_over_a_jira_write():
+    rows = [jira("addOrEditJiraIssueComment", issueIdOrKey="PPA-1", commentBody="x"),
+            bash('git commit -m "fix: the thing (PPA-2)"')]
+    assert charged(rows) == ["PPA-2"]
+
+
+def test_a_jira_write_is_used_when_no_commit_names_a_key():
+    rows = [bash('git commit -m "fix: the thing"'),
+            jira("transitionJiraIssue", issueIdOrKey="PPA-3", transition={"id": "1"})]
+    assert charged(rows) == ["PPA-3"]
+
+
+@pytest.mark.parametrize("tool, args", [
+    ("addOrEditJiraIssueComment", {"issueIdOrKey": "PPA-2", "commentBody": "x"}),
+    ("editJiraIssue", {"issueIdOrKey": "PPA-2", "fields": {}}),
+    ("transitionJiraIssue", {"issueIdOrKey": "PPA-2"}),
+    ("executeWrite", {"name": "createIssueLink",
+                      "inputs": {"inwardIssue": "PPA-2", "outwardIssue": "PPA-9"}}),
+])
+def test_an_edit_a_comment_a_transition_and_a_link_are_each_evidence(tool, args):
+    assert charged([jira(tool, **args)]) == ["PPA-2"]
+
+
+def test_neither_commit_nor_write_gives_the_even_split():
+    assert charged([bash("ls"), call("Read", file_path="/x")]) == [
+        "PPA-1", "PPA-2", "PPA-3"]
+    assert charged([]) == ["PPA-1", "PPA-2", "PPA-3"]
+
+
+def test_evidence_naming_two_dispatch_keys_splits_between_them():
+    rows = [bash('git commit -m "fix: both (PPA-3, PPA-1)"')]
+    assert charged(rows) == ["PPA-1", "PPA-3"]
+    parts = hook.parts_by_key("S", [(turn(durationMs=301000), charged(rows))])
+    assert {k: v[0][1] for k, v in parts.items()} == {"PPA-1": 151, "PPA-3": 150}
+
+
+def test_evidence_naming_only_a_key_outside_the_dispatch_falls_through():
+    rows = [bash('git commit -m "fix: other (PPA-99)"'),
+            jira("editJiraIssue", issueIdOrKey="PPA-3", fields={})]
+    assert charged(rows) == ["PPA-3"]
+    rows = [jira("editJiraIssue", issueIdOrKey="PPA-99", fields={})]
+    assert charged(rows) == ["PPA-1", "PPA-2", "PPA-3"]
+
+
+def test_a_branch_name_or_a_jira_read_alone_gives_the_even_split():
+    rows = [bash("git checkout -b ppa-2 && git push origin ppa-2"),
+            bash('git commit -m "wip" && git push origin ppa-2', id="t2"),
+            jira("getJiraIssue", id="t3", issueIdOrKey="PPA-1"),
+            jira("executeRead", id="t4", name="getIssue", inputs={"key": "PPA-1"})]
+    assert charged(rows) == ["PPA-1", "PPA-2", "PPA-3"]
+
+
+def test_a_heredoc_commit_message_is_read():
+    command = ("git commit -m \"$(cat <<'EOF'\nfix: x (PPA-2)\n\n"
+               "Co-Authored-By: Claude\nEOF\n)\" && git push origin ppa-1")
+    assert charged([bash(command)]) == ["PPA-2"]
+
+
+def test_a_commit_or_write_that_errored_is_not_evidence():
+    rows = [bash('git commit -m "fix (PPA-2)"'),
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "is_error": True}]}}]
+    assert charged(rows) == ["PPA-1", "PPA-2", "PPA-3"]
+
+
+def test_evidence_is_the_turns_own_not_an_earlier_turns():
+    path_rows = [prompt("PPA-1, PPA-2"), bash('git commit -m "(PPA-2)"'),
+                 turn(uuid="a"), turn(uuid="b")]
+    assert [k for _, k in turns_of(path_rows)] == [["PPA-2"], ["PPA-1", "PPA-2"]]
+
+
+@pytest.mark.parametrize("ms, rows", [
+    (485745, [bash('git commit -m "(PPA-1, PPA-2, PPA-3)"')]),
+    (485745, [bash('git commit -m "(PPA-2, PPA-3)"')]),
+    (301000, [jira("editJiraIssue", issueIdOrKey="PPA-3", fields={})]),
+    (7, []),
+])
+def test_the_parts_sum_exactly_to_the_turn_duration(ms, rows):
+    row = turn(durationMs=ms)
+    parts = hook.parts_by_key("S", [(row, charged(rows))])
+    assert sum(p[1] for v in parts.values() for p in v) == (ms + 500) // 1000
+
+
+def test_an_evidenced_turn_posts_only_on_its_evidenced_key(run):
+    _, router, _ = run([prompt("PPA-1, PPA-2"), bash('git commit -m "(PPA-2)"'),
+                        turn(durationMs=310000)])
+    assert [(p["issueId"], p["timeSpentSeconds"]) for p in router.posts] == [(45002, 360)]
