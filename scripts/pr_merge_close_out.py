@@ -1659,7 +1659,7 @@ def notice_text(key, failures, sha, pr_number):
             f"{rows}\n"
             f"\n"
             f"_Questions about this notice? Reply in thread and tag "
-            f"<@{NOTICE_TAG}> \u2014 I'll look into it._")
+            f"<@{NOTICE_TAG}>. I'll look into it._")
 
 
 def post_notice(token, channel_id, text):
