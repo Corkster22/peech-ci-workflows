@@ -13,6 +13,11 @@
             "type": "command",
             "command": "r=\"${CLAUDE_PLUGIN_ROOT:-}\"; if [ -z \"$r\" ]; then r=$(ls -dt \"$HOME\"/.claude/plugins/cache/peech-ci/pt-automation-hooks/*/ 2>/dev/null | head -1); r=\"${r%/}\"; fi; h=\"$r/hooks/post_pending_turns.py\"; [ ! -f \"$h\" ] && exit 0; exec python3 \"$h\"",
             "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "r=\"${CLAUDE_PLUGIN_ROOT:-}\"; if [ -z \"$r\" ]; then r=$(ls -dt \"$HOME\"/.claude/plugins/cache/peech-ci/pt-automation-hooks/*/ 2>/dev/null | head -1); r=\"${r%/}\"; fi; h=\"$r/hooks/delete_merged_branches.py\"; [ ! -f \"$h\" ] && exit 0; exec python3 \"$h\"",
+            "timeout": 30
           }
         ]
       }
