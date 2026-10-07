@@ -1619,9 +1619,9 @@ def post_held(post, key, failures, comments, sha, dry_run=False):
 #: The environment variable naming the channel a held notice goes to, set by
 #: merge-close-out.yml from its slack_channel input (PPA-1601). Read from the
 #: environment and never written into this file: the id is
-#: configuration, it differs per repository, and this file is one of three
-#: registered copies (scripts/cross_repo_copies.py), so a literal here would
-#: ship one repository's channel into the other two.
+#: configuration, it differs per repository, and this file has one home here
+#: that every caller runs through workflow_call, so a literal here would ship
+#: this repository's channel into every caller.
 CHANNEL_VAR = "SLACK_CHANNEL_DELIVERY_OPS"
 
 #: The bot token the notice posts with. The caller passes it as a secret; with

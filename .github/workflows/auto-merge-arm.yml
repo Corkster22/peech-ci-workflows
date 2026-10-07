@@ -1,4 +1,4 @@
-name: Auto-Merge — Arm
+name: "Auto-Merge: Arm"
 
 # PPA-1590. peech-pmo-automation's auto-merge-arm.yml at origin/main fadfc00,
 # served as a callable workflow. The header history lives in that copy — why
