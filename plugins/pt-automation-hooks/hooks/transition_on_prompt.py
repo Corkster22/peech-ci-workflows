@@ -532,8 +532,10 @@ WORK_TYPES = (("EXA: Delegated Discovery", "Discovery"),
 TARGET_START = "Target start"
 HOLD_ZONE = "America/New_York"
 
-#: How a Discovery dispatch is launched (Ruling 1A, 29-SEP-2026).
-DISCOVERY_LAUNCH = "claude --model opus --effort high"
+#: How a Discovery dispatch is launched. Medium since Decision 5B, 07-OCT-2026
+#: (PPA-1931); the ``--effort high`` in Ruling 1A's docstring above is the dated
+#: record of the launch it ruled on 29-SEP-2026.
+DISCOVERY_LAUNCH = "claude --model opus --effort medium"
 
 #: One JSON record per failure, appended. Outside every repository on purpose —
 #: see "Every failure is also logged" above.

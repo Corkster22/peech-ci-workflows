@@ -1059,13 +1059,13 @@ def test_a_leading_line_mixing_both_types_is_refused_with_the_split_named(
     assert code == 2, "a mixed dispatch must refuse, not warn"
     assert fired(sandbox) == [], "a refused prompt transitions nothing"
     assert [r["reason"] for r in log_records()] == ["dispatch-mixed-work-types"]
-    assert "claude --model opus --effort high" in message
+    assert "claude --model opus --effort medium" in message
     delegated_half, discovery_half = [
         line for line in message.splitlines() if line.startswith(
             ("Delegated", "Discovery"))]
     assert "PPA-11" in delegated_half and "PPA-21" not in delegated_half
     assert "PPA-21" in discovery_half and "PPA-11" not in discovery_half
-    assert "claude --model opus --effort high" in discovery_half
+    assert "claude --model opus --effort medium" in discovery_half
 
 
 def test_naming_every_key_does_not_clear_a_mixed_line(
