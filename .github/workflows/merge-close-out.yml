@@ -1,4 +1,4 @@
-name: Merge Close-Out — Record
+name: "Merge Close-Out: Record"
 
 # PPA-1577. The merge close-out peech-pmo-automation runs on its own merges,
 # served as a callable workflow so a caller repository stops carrying copies of

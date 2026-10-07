@@ -1,4 +1,4 @@
-name: Behind Branch — Update
+name: "Behind Branch: Update"
 
 # PPA-1590. peech-pmo-automation's behind-branch-update.yml at origin/main
 # fadfc00, served as a callable workflow. The header history lives in that copy
