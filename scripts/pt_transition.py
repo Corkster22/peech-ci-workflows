@@ -148,6 +148,7 @@ MERGE_CLOSE_OUT_WORKFLOW = ".github/workflows/merge-close-out.yml"
 # still compares GITHUB_EVENT_NAME to "push" alone. Its close-out calls this
 # repository's workflow, which runs this copy, so that copy runs only locally,
 # where merge_close_out_run() is False whatever the tuple holds.
+# That copy was retired under PPA-1661 and PPA-1662; this file is now the only one.
 CLOSE_OUT_EVENTS = ("push", "schedule")
 
 # Status *names* whose arrival is a gate verdict rather than a work event, so

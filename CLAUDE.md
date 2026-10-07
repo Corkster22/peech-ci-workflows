@@ -34,9 +34,11 @@ PeechTech-Framework-SharedAutomationRouting in peech-pmo-automation.
 | `.claude-plugin/marketplace.json` | The `peech-ci` plugin marketplace that publishes the hooks plugin. |
 | `.claude/settings.json` | This repository's Claude Code settings: enables the hooks plugin from the `peech-ci` marketplace and allows `git add`, `commit` and `push`. |
 
-The two scripts have registered copies in the sibling repositories, listed in
-peech-pmo-automation's cross-repository copy register. An edit here is half a
-change until the counterpart lands or is retired.
+The two scripts have one home, here. peech-pmo-automation, peech-skills and
+peech-org-skills hold no copy and run these through `workflow_call`, or, for the
+hooks plugin and peech-pmo-automation's scripts, from the clone or the CI
+checkout of this repository. The copy register was retired under PPA-1594, so an
+edit here needs no counterpart in a sibling repository.
 
 ## Tech Stack
 
