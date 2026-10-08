@@ -159,6 +159,10 @@ def sandbox(tmp_path, monkeypatch):
     # stubbed out here so no case below depends on what is installed on it.
     # The drift section builds its own trees and calls skill_drift() directly.
     monkeypatch.setattr(hook, "report_skill_drift", lambda *a, **kw: None)
+    # PPA-1940 put the dispatch cap in front of the transition. The fixture
+    # keys carry no estimate, so every multi-key case here would count as over
+    # the cap; the cap section restores the real check.
+    monkeypatch.setattr(hook, "check_dispatch_cap", lambda *a, **kw: None)
     return tmp_path
 
 
@@ -1123,8 +1127,8 @@ def test_the_dispatch_set_listing_shows_each_keys_work_type(monkeypatch):
     monkeypatch.setattr(REAL, "_jira_get", fake_get)
 
     assert REAL.dispatch_set_lines("peech-skills") == [
-        "PPA-11\tTo Do\tDelegated\tPASS",
-        "PPA-21\tTo Do\tDiscovery\tPASS",
+        "PPA-11\tTo Do\tDelegated\tPASS\tno estimate",
+        "PPA-21\tTo Do\tDiscovery\tPASS\tno estimate",
     ]
 
 
@@ -2628,6 +2632,142 @@ def test_what_the_check_detects_and_its_bar_list_are_unchanged():
 
 
 # --------------------------------------------------------------------------
+# A dispatch carries at most four hours of estimated work - PPA-1940
+# --------------------------------------------------------------------------
+#
+# Sean's Decision 1A, 07-OCT-2026: the eight-ticket dispatch that day reached 87
+# percent of its session's context limit. The estimate is read by the search the
+# hook already makes, so the cap adds no Jira call.
+
+HOUR = 3600
+
+
+def capped(sandbox, monkeypatch, estimates):
+    """Serve ``{key: seconds or None}`` through the shared read, with the real
+    cap check in place of the sandbox's stub."""
+    install_stub(sandbox)
+    shared = {k: bar_fields(estimate_seconds=v) for k, v in estimates.items()}
+    monkeypatch.setattr(hook, "read_dispatched", lambda keys, **kw: (shared, None))
+    monkeypatch.setattr(hook, "check_dispatch_cap", REAL.check_dispatch_cap)
+    monkeypatch.setattr(REAL, "LOG", hook.LOG)
+
+
+def test_a_dispatch_under_the_cap_passes(sandbox, monkeypatch, capsys):
+    capped(sandbox, monkeypatch, {"PPA-1": 2 * HOUR, "PPA-2": 2 * HOUR})
+
+    code, _ = run("PPA-1, PPA-2", capsys=capsys)
+
+    assert code == 0, "four hours exactly is at the cap, not past it"
+    assert fired(sandbox) == ["PPA-1", "PPA-2"]
+
+
+def test_a_dispatch_over_the_cap_is_refused_naming_the_sum_and_each_estimate(
+        sandbox, monkeypatch, capsys):
+    capped(sandbox, monkeypatch, {"PPA-1": 3 * HOUR, "PPA-2": 1.5 * HOUR})
+
+    code, _ = run("PPA-1, PPA-2")
+    err = capsys.readouterr().err
+
+    assert code == 2 and fired(sandbox) == []
+    assert "4.5h" in err and "cap is 4h" in err
+    assert "PPA-1: 3h" in err and "PPA-2: 1.5h" in err
+    assert "Split it" in err and "Cap override: <reason>" in err
+    assert "dispatch-over-cap" in [r["reason"] for r in log_records()]
+
+
+def test_a_single_key_over_the_cap_passes(sandbox, monkeypatch, capsys):
+    capped(sandbox, monkeypatch, {"PPA-1": 9 * HOUR})
+
+    code, _ = run("PPA-1", capsys=capsys)
+
+    assert code == 0 and fired(sandbox) == ["PPA-1"]
+
+
+def test_a_key_with_no_estimate_counts_as_the_full_cap(
+        sandbox, monkeypatch, capsys):
+    capped(sandbox, monkeypatch, {"PPA-1": None, "PPA-2": HOUR})
+
+    code, _ = run("PPA-1, PPA-2")
+    err = capsys.readouterr().err
+
+    assert code == 2, "an unestimated key plus one hour is over four hours"
+    assert "5h" in err and "PPA-1: 4h (no Original Estimate" in err
+
+
+def test_the_cap_override_line_lets_an_over_cap_dispatch_through(
+        sandbox, monkeypatch, capsys):
+    capped(sandbox, monkeypatch, {"PPA-1": 3 * HOUR, "PPA-2": 3 * HOUR})
+
+    code, _ = run("PPA-1, PPA-2\nCap override: the two edit one function",
+                  capsys=capsys)
+
+    assert code == 0 and fired(sandbox) == ["PPA-1", "PPA-2"]
+
+
+def test_a_cap_override_line_with_no_reason_does_not_count(
+        sandbox, monkeypatch, capsys):
+    capped(sandbox, monkeypatch, {"PPA-1": 3 * HOUR, "PPA-2": 3 * HOUR})
+
+    code, _ = run("PPA-1, PPA-2\nCap override:", capsys=capsys)
+
+    assert code == 2
+
+
+def test_a_failed_estimate_read_warns_and_allows(sandbox, monkeypatch, capsys):
+    install_stub(sandbox)
+    monkeypatch.setattr(hook, "read_dispatched",
+                        lambda keys, **kw: (None, OSError("no route to host")))
+    monkeypatch.setattr(hook, "check_dispatch_cap", REAL.check_dispatch_cap)
+    monkeypatch.setattr(REAL, "LOG", hook.LOG)
+
+    code, out = run("PPA-1, PPA-2", capsys=capsys)
+
+    assert code == 0 and fired(sandbox) == ["PPA-1", "PPA-2"]
+    assert "dispatch size not checked" in json.loads(out)["systemMessage"]
+
+
+def test_the_estimate_rides_the_shared_read_and_adds_no_call(monkeypatch):
+    seen = []
+
+    def fake_get(path, timeout=None):
+        seen.append(path)
+        return {"issues": [{"key": "PPA-1", "fields": {
+            "status": {"name": "To Do"}, "components": [],
+            "timeoriginalestimate": 5400}}]}
+
+    monkeypatch.setattr(REAL, "_jira_get", fake_get)
+    fields = REAL.dispatched_fields(["PPA-1"])
+
+    assert len(seen) == 1 and "timeoriginalestimate" in seen[0]
+    assert fields["PPA-1"]["estimate_seconds"] == 5400
+    assert REAL.DISPATCH_CAP_SECONDS == 4 * HOUR
+
+
+def test_the_dispatch_set_prints_each_keys_estimate_beside_its_verdict(
+        monkeypatch):
+    def fake_get(path, timeout=None):
+        if path == "/field":
+            return FIELD_LIST
+        if "issuelinks" in path:
+            return {"issues": [{"key": k, "fields": {"issuelinks": []}}
+                               for k in ("PPA-11", "PPA-12")]}
+        return {"issues": [{"key": k, "fields": {
+            "status": {"name": "To Do"},
+            "components": [{"name": n} for n in TYPED[k]],
+            "timeoriginalestimate": est,
+            "description": adf("## Scope boundary\nOne file."),
+            "customfield_10767": adf("[machine] One condition.")}}
+            for k, est in (("PPA-11", 5400), ("PPA-12", None))]}
+
+    monkeypatch.setattr(REAL, "_jira_get", fake_get)
+
+    assert REAL.dispatch_set_lines("peech-skills") == [
+        "PPA-11\tTo Do\tDelegated\tPASS\t1.5h",
+        "PPA-12\tTo Do\tDelegated\tPASS\tno estimate",
+    ]
+
+
+# --------------------------------------------------------------------------
 # --dispatch-set <repo> - PPA-1660
 # --------------------------------------------------------------------------
 
@@ -2688,8 +2828,8 @@ def test_a_key_failing_the_bar_is_printed_with_its_reason(monkeypatch):
     lines = REAL.dispatch_set_lines("REPO: peech-skills")
 
     assert lines == [
-        "PPA-2\tTo Do\tDelegated\tPASS",
-        "PPA-3\tReopened\tDelegated\tFAIL - missing a scope boundary",
+        "PPA-2\tTo Do\tDelegated\tPASS\tno estimate",
+        "PPA-3\tReopened\tDelegated\tFAIL - missing a scope boundary\tno estimate",
         "# not demanded, blocked by PPA-9: PPA-1",
     ]
 
@@ -2885,7 +3025,7 @@ def test_the_listing_orders_blocked_then_held_after_the_set(monkeypatch):
     monkeypatch.setattr(REAL, "_jira_get", get)
 
     assert REAL.dispatch_set_lines("peech-skills") == [
-        "PPA-3\tTo Do\tDelegated\tPASS",
+        "PPA-3\tTo Do\tDelegated\tPASS\tno estimate",
         "# not demanded, blocked by PPA-9: PPA-1",
         f"# not demanded, held until {tomorrow}: PPA-2"]
 
