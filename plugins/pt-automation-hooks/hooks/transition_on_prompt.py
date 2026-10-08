@@ -693,7 +693,8 @@ def dispatched_fields(keys, timeout=JIRA_TIMEOUT):
     """
     query = urllib.parse.urlencode({
         "jql": f"key in ({', '.join(keys)})",
-        "fields": "status,components,description,customfield_10767",
+        "fields": "status,components,description,customfield_10767,"
+                  "timeoriginalestimate",
         "maxResults": 100,
     })
     data = _jira_get(f"/search/jql?{query}", timeout)
@@ -714,6 +715,9 @@ def dispatched_fields(keys, timeout=JIRA_TIMEOUT):
             # The description unflattened, since PPA-1758: the Change section
             # is found by its heading, which flattening loses.
             "description_adf": fields.get("description"),
+            # Seconds, or None where the ticket carries no Original Estimate
+            # (PPA-1940): the dispatch cap sums it from this same read.
+            "estimate_seconds": fields.get("timeoriginalestimate"),
         }
     return found
 
@@ -758,16 +762,25 @@ def session_repository(project_dir=None):
     its last path segment is the repository name - the same name the ``REPO:``
     component carries, because every checkout in the estate is cloned under its
     own name. A variable that is unset, empty or unreadable answers None, and
-    every caller turns that into a warn-and-allow.
+    every caller turns that into a warn-and-allow. A worktree under
+    ``.claude/worktrees/`` answers the repository that holds it (PPA-1988).
     """
     root = project_dir if project_dir is not None else os.environ.get(
         "CLAUDE_PROJECT_DIR")
     if not root:
         return None
     try:
-        return Path(root).resolve().name or None
+        resolved = Path(root).resolve()
     except (OSError, ValueError):
         return None
+    # PPA-1988: ``claude --worktree`` roots a session at
+    # <repo>/.claude/worktrees/<name>, so the segment before ``.claude`` is the
+    # repository. The last pair wins, as the nearest enclosing repository does.
+    parts = resolved.parts
+    for i in range(len(parts) - 2, 0, -1):
+        if parts[i:i + 2] == (".claude", "worktrees"):
+            return parts[i - 1]
+    return resolved.name or None
 
 
 def repository_mismatches(mapping, session_repo):
@@ -1431,6 +1444,72 @@ def merge_wait_block_message(waiting):
     )
 
 
+#: PPA-1940. One dispatch carries at most this much estimated work: the 07-OCT
+#: 2026 pmo dispatch of eight tickets ran past an hour and reached 87 percent of
+#: its session's context limit. Seconds, as Jira stores Original Estimate.
+DISPATCH_CAP_SECONDS = 4 * 60 * 60
+
+#: The opt-out for a coupled batch the generator could not split: a line below
+#: the key line that names the cap and gives a reason.
+_CAP_OVERRIDE_RE = re.compile(r"^\s*cap override:\s*\S", re.IGNORECASE)
+
+
+def _hours(seconds):
+    return f"{seconds / 3600:g}h"
+
+
+def cap_overridden(prompt):
+    """True when a line below the key line carries ``Cap override: <reason>``."""
+    lines = [line for line in unwrapped(prompt).splitlines() if line.strip()]
+    return any(_CAP_OVERRIDE_RE.match(line) for line in lines[1:])
+
+
+def cap_block_message(estimates, total):
+    """What the conductor reads when a dispatch carries too much work. Names the
+    sum, each key's estimate and both ways to proceed."""
+    lines = "\n".join(
+        f"  {key}: {_hours(seconds)}" + ("" if known else " (no Original Estimate, "
+                                         "counted as the full cap)")
+        for key, (seconds, known) in estimates.items())
+    return (
+        f"Dispatch carries {_hours(total)} of estimated work; the cap is "
+        f"{_hours(DISPATCH_CAP_SECONDS)}.\n\n"
+        f"{lines}\n\n"
+        "Split it into dispatches that each stay under the cap, or, for a "
+        "coupled batch that cannot be split, add a line below the key line "
+        "reading `Cap override: <reason>`. A dispatch of one key is never "
+        "refused for its size."
+    )
+
+
+def check_dispatch_cap(prompt, keys, shared=None):
+    """The block message when the dispatch's summed estimate passes the cap.
+
+    PPA-1940. The estimate comes from the shared read, so this adds no Jira
+    call. A key with no Original Estimate counts as the full cap, because an
+    unestimated ticket is unbounded work. A failed read warns and allows, as
+    every other read failure here does, and so does a key Jira did not return.
+    """
+    if len(keys) < 2:
+        return None
+    if shared is None or any(key not in shared for key in keys):
+        log("cap-read-failed", keys)
+        warn("dispatch size not checked - the estimate read did not return "
+             "every dispatched key.")
+        return None
+    estimates = {}
+    for key in keys:
+        seconds = shared[key].get("estimate_seconds")
+        estimates[key] = ((seconds, True) if seconds
+                          else (DISPATCH_CAP_SECONDS, False))
+    total = sum(seconds for seconds, _ in estimates.values())
+    if total <= DISPATCH_CAP_SECONDS or cap_overridden(prompt):
+        return None
+    log("dispatch-over-cap", keys, total_seconds=total,
+        estimates={k: v[0] for k, v in estimates.items()})
+    return cap_block_message(estimates, total)
+
+
 def check_quality_bar(prompt, keys, shared=None):
     """(block message or None, {key: live status}) for the dispatched keys.
 
@@ -1966,8 +2045,8 @@ def check_dispatch_complete(prompt, keys, fields=None):
 def dispatch_set_lines(repository):
     """One line per key the completeness check would demand - PPA-1660.
 
-    Each line is ``key``, ``status``, ``work type`` (PPA-1716) and the Bar
-    verdict, tab-separated. The set spans both work types; a dispatch is
+    Each line is ``key``, ``status``, ``work type`` (PPA-1716), the Bar
+    verdict and the Original Estimate (PPA-1940), tab-separated. The set spans both work types; a dispatch is
     measured against one of them.
 
     Chat composed dispatches from build_delegated_batches.py or a JQL read, and
@@ -1996,12 +2075,16 @@ def dispatch_set_lines(repository):
     lines = []
     for key in keys:
         if key not in fields:
-            lines.append(f"{key}\t?\t?\tBar not read - Jira did not return the key")
+            lines.append(f"{key}\t?\t?\tBar not read - Jira did not return the key"
+                         "\t?")
             continue
         missing = bar_failures(fields[key])
         verdict = f"FAIL - missing {', '.join(missing)}" if missing else "PASS"
         kind = work_type_of(fields[key]["components"]) or "?"
-        lines.append(f"{key}\t{fields[key]['status']}\t{kind}\t{verdict}")
+        seconds = fields[key]["estimate_seconds"]
+        estimate = _hours(seconds) if seconds else "no estimate"
+        lines.append(
+            f"{key}\t{fields[key]['status']}\t{kind}\t{verdict}\t{estimate}")
     lines.extend(f"# not demanded, blocked by {', '.join(blockers)}: {key}"
                  for key, blockers in excluded)
     lines.extend(f"# not demanded, held until {until}: {key}"
@@ -2118,6 +2201,13 @@ def _transition():
         # conductor is shown. Nothing is transitioned: the session will not act
         # on this prompt, so moving its tickets would record work not started.
         print(blocked, file=sys.stderr)
+        return 2
+
+    oversized = check_dispatch_cap(prompt, keys, shared=shared)
+    if oversized is not None:
+        # Refused for the same reason as the two above: the command is wrong,
+        # not the bookkeeping. Nothing is transitioned.
+        print(oversized, file=sys.stderr)
         return 2
 
     bar_blocked, statuses = check_quality_bar(prompt, keys, shared=shared)
