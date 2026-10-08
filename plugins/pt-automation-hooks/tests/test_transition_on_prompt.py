@@ -1776,6 +1776,20 @@ def test_the_session_repository_comes_from_claude_project_dir(monkeypatch, tmp_p
     assert hook.session_repository(f"{root}/") == "peech-skills", "a trailing slash"
 
 
+def test_a_worktree_under_dot_claude_resolves_to_the_repository_holding_it(
+        monkeypatch, tmp_path):
+    """PPA-1988. ``claude --worktree`` roots the session at
+    <repo>/.claude/worktrees/<name>, whose last segment is the worktree's name
+    and not the repository's, so every dispatch from one was refused as being
+    for another repository."""
+    worktree = tmp_path / "peech-skills" / ".claude" / "worktrees" / "ppa-1"
+    worktree.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(worktree))
+
+    assert hook.session_repository() == "peech-skills"
+    assert hook.session_repository(f"{worktree}/") == "peech-skills"
+
+
 @pytest.mark.parametrize("value", ["", None])
 def test_an_unset_project_dir_reads_as_unknown(monkeypatch, value):
     """Unset or empty is 'unknown', never a repository named '' that mismatches

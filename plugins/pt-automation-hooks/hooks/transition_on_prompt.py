@@ -758,16 +758,25 @@ def session_repository(project_dir=None):
     its last path segment is the repository name - the same name the ``REPO:``
     component carries, because every checkout in the estate is cloned under its
     own name. A variable that is unset, empty or unreadable answers None, and
-    every caller turns that into a warn-and-allow.
+    every caller turns that into a warn-and-allow. A worktree under
+    ``.claude/worktrees/`` answers the repository that holds it (PPA-1988).
     """
     root = project_dir if project_dir is not None else os.environ.get(
         "CLAUDE_PROJECT_DIR")
     if not root:
         return None
     try:
-        return Path(root).resolve().name or None
+        resolved = Path(root).resolve()
     except (OSError, ValueError):
         return None
+    # PPA-1988: ``claude --worktree`` roots a session at
+    # <repo>/.claude/worktrees/<name>, so the segment before ``.claude`` is the
+    # repository. The last pair wins, as the nearest enclosing repository does.
+    parts = resolved.parts
+    for i in range(len(parts) - 2, 0, -1):
+        if parts[i:i + 2] == (".claude", "worktrees"):
+            return parts[i - 1]
+    return resolved.name or None
 
 
 def repository_mismatches(mapping, session_repo):
