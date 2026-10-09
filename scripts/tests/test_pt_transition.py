@@ -295,29 +295,62 @@ def _no_direct_close(ppa_plan):
     return plan
 
 
-def test_done_from_in_progress_is_not_gated_by_the_conductor_flag(ppa_plan):
-    """PPA-1264 named test 1, narrowed by PPA-1433.
+def test_done_from_in_progress_without_the_conductor_flag_halts(ppa_plan):
+    """PPA-1264 named test 1, narrowed by PPA-1433 and again by PPA-2009.
 
-    PPA-1264's guarantee still holds and is what this asserts: Done is not a
-    conductor-owned destination, so --conductor neither unlocks nor blocks it.
-    What changed is that the hop no longer fires — PPA-1433 refuses it on the
-    source status instead. The flag is irrelevant in both directions, which is
-    the point: a caller carrying it out of habit gets the same answer, and a
-    reader must not mistake the halt below for a conductor halt.
+    Done is not a conductor-owned destination, so the halt below is the
+    PPA-1433 source rule and not a CONDUCTOR_ONLY halt. Without --conductor the
+    hop still refuses and writes nothing; the run that carries the flag is
+    covered by test_conductor_closes_in_progress_straight_to_done.
     """
     assert pt_transition.requires_conductor("Done") is False
     assert "Done" not in pt_transition.CONDUCTOR_ONLY
 
-    for conductor in (False, True):
-        stub = StubJira("In Progress", ppa_plan)
+    stub = StubJira("In Progress", ppa_plan)
 
-        results = run(stub.get, stub.post, ["PPA-1"], "Done",
-                      conductor=conductor)
+    results = run(stub.get, stub.post, ["PPA-1"], "Done", conductor=False)
 
-        assert results[0].verdict == "HALT", f"conductor={conductor}"
-        assert "CONDUCTOR_ONLY" not in results[0].detail
-        assert "Client Validation" in results[0].detail
-        assert stub.posts == [], "the guard must write nothing"
+    assert results[0].verdict == "HALT"
+    assert "CONDUCTOR_ONLY" not in results[0].detail
+    assert "Client Validation" in results[0].detail
+    assert stub.posts == [], "the guard must write nothing"
+
+
+def test_conductor_closes_in_progress_straight_to_done(ppa_plan):
+    """PPA-2009. Sean's 23-SEP-2026 ruling: a ticket needing no human check
+    closes straight to Done. One hop, matched by destination status, fired on
+    the transition the stub offers from In Progress onto Done."""
+    stub = StubJira("In Progress", ppa_plan)
+
+    results = run(stub.get, stub.post, ["PPA-1"], "Done", conductor=True)
+
+    assert results[0].verdict == "PASS"
+    assert results[0].start == "In Progress"
+    assert results[0].end == "Done"
+    assert results[0].hops == 1
+    assert stub.status == "Done"
+    assert [payload["transition"]["id"] for _, payload in stub.posts] == ["3"]
+    assert exit_code(results) == 0
+
+
+def test_conductor_flag_does_not_carry_a_walk_from_to_do_onto_done(ppa_plan):
+    """The flag covers the run's first hop only, like the PPA-1459 exemption: a
+    run from To Do takes the ladder hop onto In Progress and halts there."""
+    stub = StubJira("To Do", ppa_plan)
+
+    results = run(stub.get, stub.post, ["PPA-1"], "Done", conductor=True)
+
+    assert results[0].verdict == "HALT"
+    assert stub.status == "In Progress"
+    assert [payload["transition"]["id"] for _, payload in stub.posts] == ["10"]
+
+
+@pytest.mark.parametrize("source", ["To Do", "Reopened", "BLOCKED"])
+def test_the_conductor_claim_covers_in_progress_and_no_other_rung(source):
+    assert pt_transition.validation_skipped(
+        source, "Done", conductor=True) is not None
+    assert pt_transition.validation_skipped(
+        "In Progress", "Done", conductor=True) is None
 
 
 def test_start_transition_needs_no_conductor_flag(ppa_plan):
@@ -651,6 +684,13 @@ def test_a_dry_run_surfaces_the_refusal_rather_than_a_plan(ppa_plan):
     assert results[0].verdict == "HALT"
     assert "'Client Validation'" in results[0].detail
     assert stub.posts == []
+
+
+def test_the_docstring_records_the_23_sep_ruling_replacing_the_13_sep_rule():
+    doc = pt_transition.__doc__
+    assert "PPA-2009" in doc
+    assert "23-SEP-2026" in doc and "13-SEP-2026" in doc
+    assert "replaces the\n13-SEP-2026 rule" in doc
 
 
 def test_the_docstring_records_ppa_1382_superseding_ppa_1264():

@@ -71,9 +71,23 @@ actor they were written about — a session judging its own work — and that ac
 reaches Done through neither: it cannot pass a flag that does not exist, and it
 cannot be a GitHub Actions runner.
 
-Reopened stays gated, and it is now the whole of --conductor's job. Reopened is
-a rejection verdict, a human judgement about work that failed, so it never
-becomes a mechanical fact any workflow can observe.
+Reopened stays gated, and --conductor's job is Reopened and, since PPA-2009,
+the direct close. Reopened is a rejection verdict, a human judgement about work
+that failed, so it never becomes a mechanical fact any workflow can observe.
+
+PPA-2009 (09-OCT-2026) applies Sean's ruling of 23-SEP-2026, which replaces the
+13-SEP-2026 rule that every ticket a person closes reaches Done through Client
+Validation. A ticket goes to Client Validation only when a human check is
+needed; otherwise it closes straight to Done. A run that passes --conductor may
+now fire In Progress to Done, the one offered transition that lands there
+("Closed - No client approval required"), matched by destination status and
+never by name. A run without --conductor keeps the PPA-1433 refusal. This is an
+override under a name, and the trust model is the one stated for Reopened below:
+--conductor is a claim, not an identity, and it closes the inattention path, not
+a deliberate one. The two earlier failures were a delegated session closing its own
+ticket around Client Validation; which tickets need
+Client Validation stays the conductor's call per ticket. The merge close-out
+exemption (PPA-1459) is unchanged.
 
 The guard is declarative, not authenticated. load_credentials() reads one
 JIRA_EMAIL / JIRA_API_TOKEN pair, so the conductor and a delegated session
@@ -295,7 +309,8 @@ def merge_close_out_run(environ):
             and workflow.endswith("/" + MERGE_CLOSE_OUT_WORKFLOW))
 
 
-def validation_skipped(source, destination, merge_close_out=False):
+def validation_skipped(source, destination, merge_close_out=False,
+                       conductor=False):
     """The halt reason when a hop lands on Done from a rung that may not reach
     it, else None.
 
@@ -324,10 +339,16 @@ def validation_skipped(source, destination, merge_close_out=False):
     half, that the hop be the run's first, so the exemption cannot be picked up
     part-way along the ladder.
 
-    What did not change: a hand run is refused from every rung, Client
-    Validation remains the one source any caller may reach Done from, and
-    Client Validation to Reopened is untouched. Ruled 13-SEP-2026 and standing:
-    every PPA ticket a person closes reaches Done through Client Validation.
+    PPA-2009 adds the conductor as a second caller of the same one hop. Ruled
+    23-SEP-2026, replacing the 13-SEP-2026 rule that every ticket a person
+    closes reaches Done through Client Validation: a ticket needing no human
+    check closes straight to Done. The flag is the claim module docstring
+    describes, not an identity, and it covers In Progress to Done only, on the
+    run's first hop like the exemption above.
+
+    What did not change: a hand run without --conductor is refused from every
+    rung, Client Validation remains the one source any caller may reach Done
+    from, and Client Validation to Reopened is untouched.
 
     Pure by design, like requires_conductor() above: no client, no credentials,
     no network, so the guard is testable on its own.
@@ -336,12 +357,13 @@ def validation_skipped(source, destination, merge_close_out=False):
         return None
     if norm(source) == norm(VALIDATION):
         return None
-    if merge_close_out and norm(source) == norm(WORKING):
+    if (merge_close_out or conductor) and norm(source) == norm(WORKING):
         return None
     return (f"hop {source!r} -> {destination!r} skips {VALIDATION!r}, the "
-            f"acceptance gate every PPA ticket reaches {FINAL!r} through "
-            f"(PPA-1433). Only a merge close-out workflow run is exempt, and "
-            f"this process is not one (PPA-1459). Nothing fired")
+            f"acceptance gate (PPA-1433). Only a merge close-out workflow run "
+            f"is exempt (PPA-1459), and this process is not one. To close a "
+            f"ticket that needs no human check, re-run with --conductor "
+            f"(PPA-2009). Nothing fired")
 
 
 # ------------------------------------------------------------------- planning
@@ -511,8 +533,11 @@ def advance(get, post, key, target, dry_run=False, ladder=None,
         # it a --to "Done" run from To Do would take the legitimate ladder hop
         # onto In Progress and inherit the exemption on the next pass, which is
         # the same walk test_done_from_to_do_halts covers for a hand run.
+        # PPA-2009 threads the conductor flag the same way and under the same
+        # hop == 1 limit.
         skipped = validation_skipped(current, destination,
-                                     merge_close_out and hop == 1)
+                                     merge_close_out and hop == 1,
+                                     conductor and hop == 1)
         if skipped is not None:
             return Result(key, start, current, hop - 1, "HALT", skipped)
 
@@ -585,9 +610,10 @@ class RetiredFlag(argparse.Action):
         parser.error(
             f"{option_string} was retired by PPA-1264 and does nothing. It is "
             f"not coming back: PPA-1433 refuses every hop onto {FINAL!r} whose "
-            f"source is not {VALIDATION!r}, with no override, so there is "
-            f"nothing to skip. Route the ticket through {VALIDATION!r} and "
-            f"re-run without the flag.")
+            f"source is not {VALIDATION!r}, so there is nothing to skip. "
+            f"Route the ticket through {VALIDATION!r}, or pass --conductor to "
+            f"close from {WORKING!r} directly (PPA-2009), and re-run without "
+            f"this flag.")
 
 
 def build_parser():
@@ -602,8 +628,10 @@ def build_parser():
                         help="print the planned hops and fire nothing")
     parser.add_argument("--conductor", action="store_true",
                         help="claim the conductor role, permitting a hop onto "
-                             f"a conductor-owned status ({', '.join(CONDUCTOR_ONLY)}). "
-                             "Without it such a hop halts and writes nothing. "
+                             f"a conductor-owned status ({', '.join(CONDUCTOR_ONLY)}) "
+                             f"and the direct close from {WORKING!r} to {FINAL!r} "
+                             "(PPA-2009). Without it such a hop halts and "
+                             "writes nothing. "
                              "The claim is not verified — see the module "
                              "docstring")
     parser.add_argument("--allow-backward", action="store_true",
