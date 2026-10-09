@@ -232,9 +232,11 @@ the cost - an opt-out spent on a ticket nobody could have dispatched.
 pt-backlog holds that a readiness dependency is a Jira blocking link rather
 than a line of prose, so the link is the machine-readable statement of exactly
 this and the check reads it. A ticket carrying an ``is blocked by`` link to an
-issue that is not Done or Closed is outside the set. The excluded keys and
-their blockers are named in a warning: a check that quietly shrinks its own
-population is worse than one that asks too much.
+issue whose status category is not Done is outside the set (PPA-2017 moved the
+test from status names to the category): a blocker at Closed - Not Needed
+releases it, and one at In Progress or Client Validation does not. The excluded
+keys and their blockers are named in a warning: a check that quietly shrinks
+its own population is worse than one that asks too much.
 
 A ticket held until its start date is not dispatchable — PPA-1752
 ------------------------------------------------------------------
@@ -987,6 +989,10 @@ RESOLVED_CATEGORY = "done"
 
 def unresolved_blockers(issue):
     """The keys of every unresolved issue this one is blocked by.
+
+    A blocker is unresolved until its status category is Done, so one at Closed
+    - Not Needed releases this issue and one at In Progress or Client
+    Validation does not.
 
     pt-backlog holds that a readiness dependency is a Jira blocking link rather
     than a line of prose, so the link is the machine-readable statement of
