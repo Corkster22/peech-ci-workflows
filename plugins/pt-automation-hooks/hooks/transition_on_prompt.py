@@ -953,18 +953,36 @@ def peechpmo_dispatchable_jql():
             "AND statusCategory != Done")
 
 
-def peechpmo_dispatchable_set(timeout=JIRA_TIMEOUT):
-    """Every open dispatchable PEECHPMO key, read live from Jira. Raises."""
+def peechpmo_dispatchable_set(excluded=None, timeout=JIRA_TIMEOUT):
+    """Every open dispatchable PEECHPMO key, read live from Jira. Raises.
+
+    A ticket with an open blocking link is outside the set, as in the PPA half
+    (PPA-2017): this read once asked for no links, so PEECHPMO-524 and
+    PEECHPMO-520 were demanded on 06-OCT-2026 while blocked. ``excluded``
+    collects ``(key, blockers)`` as ``dispatchable_set`` does.
+    """
     query = urllib.parse.urlencode(
-        {"jql": peechpmo_dispatchable_jql(), "fields": "key", "maxResults": 100})
+        {"jql": peechpmo_dispatchable_jql(), "fields": "issuelinks",
+         "maxResults": 100})
     data = _jira_get(f"/search/jql?{query}", timeout)
-    return [issue["key"].upper() for issue in data.get("issues") or []]
+    keys = []
+    for issue in data.get("issues") or []:
+        key = issue["key"].upper()
+        blockers = unresolved_blockers(issue)
+        if blockers:
+            if excluded is not None:
+                excluded.append((key, blockers))
+            continue
+        keys.append(key)
+    return keys
 
 
-#: A blocker that has landed. Anything else still holds the ticket it blocks.
-#: Read as names rather than IDs, per the repository's own rule against acting
-#: on a remembered transition or status ID.
-RESOLVED_STATUSES = ("Done", "Closed")
+#: A blocker that has landed is one whose status category is Done (PPA-2017).
+#: The category is read rather than the status name: "Closed - Not Needed" is
+#: Done by category and matched no name this check listed, and the batch
+#: generator already reads the category. Anything else, To Do, In Progress and
+#: Client Validation included, still holds the ticket it blocks.
+RESOLVED_CATEGORY = "done"
 
 
 def unresolved_blockers(issue):
@@ -983,8 +1001,8 @@ def unresolved_blockers(issue):
         blocker = link.get("inwardIssue")
         if not blocker or (link.get("type") or {}).get("inward") != "is blocked by":
             continue
-        status = ((blocker.get("fields") or {}).get("status") or {}).get("name", "")
-        if status not in RESOLVED_STATUSES:
+        status = (blocker.get("fields") or {}).get("status") or {}
+        if (status.get("statusCategory") or {}).get("key") != RESOLVED_CATEGORY:
             out.append(blocker["key"].upper())
     return out
 
@@ -2010,12 +2028,17 @@ def check_peechpmo_complete(prompt):
 
     A Jira failure warns and allows, as the PPA half does.
     """
+    excluded = []
     try:
-        dispatchable = peechpmo_dispatchable_set()
+        dispatchable = peechpmo_dispatchable_set(excluded=excluded)
     except Exception as exc:  # noqa: BLE001 - every read failure warns and allows
         log("peechpmo-dispatchable-read-failed", [], error=repr(exc))
         warn(f"dispatch completeness not checked for PEECHPMO - {exc}")
         return None
+    if excluded:
+        log("blocked-tickets-excluded", [k for k, _ in excluded],
+            component="PEECHPMO", blockers=dict(excluded))
+        warn(excluded_warning(excluded))
     missing = missing_from(dispatchable, keys_in(prompt))
     if not missing:
         return None

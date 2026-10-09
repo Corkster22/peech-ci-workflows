@@ -1923,7 +1923,9 @@ def issue(key, blockers=(), blocker_status="In Progress"):
         {"type": {"name": "Blocks", "inward": "is blocked by",
                   "outward": "blocks"},
          "inwardIssue": {"key": b, "fields": {
-             "status": {"name": blocker_status}}}}
+             "status": {"name": blocker_status, "statusCategory": {
+                 "key": "done" if blocker_status in ("Done", "Closed")
+                 else "indeterminate"}}}}}
         for b in blockers]}}
 
 
@@ -1948,6 +1950,90 @@ def test_a_resolved_blocker_releases_the_ticket_it_blocked(monkeypatch, status):
     excluded = []
     assert hook.dispatchable_set("REPO: x", excluded=excluded) == ["PPA-1464"]
     assert excluded == []
+
+
+def category_issue(key, blocker, status, category):
+    """A row whose blocker carries a status name and its status category, as
+    Jira returns it."""
+    return {"key": key, "fields": {"issuelinks": [
+        {"type": {"name": "Blocks", "inward": "is blocked by",
+                  "outward": "blocks"},
+         "inwardIssue": {"key": blocker, "fields": {"status": {
+             "name": status, "statusCategory": {"key": category}}}}}]}}
+
+
+OPEN_BLOCKERS = [("To Do", "new"), ("In Progress", "indeterminate"),
+                 ("Client Validation", "indeterminate")]
+LANDED_BLOCKERS = [("Done", "done"), ("Closed", "done"),
+                   ("Closed - Not Needed", "done")]
+
+
+@pytest.mark.parametrize("status,category", OPEN_BLOCKERS)
+@pytest.mark.parametrize("ticket,blocker", [("PPA-1934", "PPA-1906"),
+                                            ("PPA-1921", "PPA-1920")])
+def test_a_blocker_not_in_the_done_category_holds_a_ppa_ticket_out(
+        monkeypatch, ticket, blocker, status, category):
+    """PPA-2017: open means the blocker's status category is not Done."""
+    monkeypatch.setattr(hook, "_jira_get", with_field_list(lambda path, timeout=None: {
+        "issues": [category_issue(ticket, blocker, status, category)]}))
+
+    excluded = []
+    assert hook.dispatchable_set("REPO: x", excluded=excluded) == []
+    assert excluded == [(ticket, [blocker])]
+
+
+@pytest.mark.parametrize("status,category", LANDED_BLOCKERS)
+def test_a_blocker_in_the_done_category_releases_a_ppa_ticket(
+        monkeypatch, status, category):
+    """Closed - Not Needed is Done by category but matched neither name the
+    hook listed, so it held its ticket out for good."""
+    monkeypatch.setattr(hook, "_jira_get", with_field_list(lambda path, timeout=None: {
+        "issues": [category_issue("PPA-1934", "PPA-1906", status, category)]}))
+
+    excluded = []
+    assert hook.dispatchable_set("REPO: x", excluded=excluded) == ["PPA-1934"]
+    assert excluded == []
+
+
+@pytest.mark.parametrize("status,category", OPEN_BLOCKERS)
+@pytest.mark.parametrize("ticket,blocker", [("PEECHPMO-524", "PEECHPMO-523"),
+                                            ("PEECHPMO-520", "PEECHPMO-497"),
+                                            ("PEECHPMO-9", "PPA-1906")])
+def test_a_blocker_not_in_the_done_category_holds_a_peechpmo_ticket_out(
+        monkeypatch, ticket, blocker, status, category):
+    """PPA-2017: the PEECHPMO set read no links at all, so PEECHPMO-524 and
+    PEECHPMO-520 were demanded while blocked."""
+    monkeypatch.setattr(hook, "_jira_get", lambda path, timeout=None: {"issues": [
+        category_issue(ticket, blocker, status, category),
+        {"key": "PEECHPMO-1", "fields": {"issuelinks": []}}]})
+
+    excluded = []
+    assert hook.peechpmo_dispatchable_set(excluded=excluded) == ["PEECHPMO-1"]
+    assert excluded == [(ticket, [blocker])]
+
+
+@pytest.mark.parametrize("status,category", LANDED_BLOCKERS)
+def test_a_blocker_in_the_done_category_releases_a_peechpmo_ticket(
+        monkeypatch, status, category):
+    monkeypatch.setattr(hook, "_jira_get", lambda path, timeout=None: {"issues": [
+        category_issue("PEECHPMO-524", "PEECHPMO-523", status, category)]})
+
+    excluded = []
+    assert hook.peechpmo_dispatchable_set(excluded=excluded) == ["PEECHPMO-524"]
+    assert excluded == []
+
+
+def test_a_blocked_peechpmo_ticket_is_not_demanded_and_is_named(
+        sandbox, monkeypatch):
+    monkeypatch.setattr(hook, "peechpmo_dispatchable_set",
+                        REAL_PEECHPMO_SET)
+    monkeypatch.setattr(hook, "_jira_get", lambda path, timeout=None: {"issues": [
+        category_issue("PEECHPMO-524", "PEECHPMO-523", "To Do", "new"),
+        {"key": "PEECHPMO-525", "fields": {"issuelinks": []}}]})
+
+    message = hook.check_peechpmo_complete("PEECHPMO-525")
+
+    assert message is None
 
 
 def test_a_ticket_with_no_links_is_unaffected(monkeypatch):
